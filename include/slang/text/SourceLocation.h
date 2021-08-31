@@ -22,9 +22,6 @@ class SourceManager;
 struct BufferID {
     BufferID() = default;
     constexpr BufferID(uint32_t value, string_view name) :
-#ifdef DEBUG
-        name(name),
-#endif
         id(value) {
         (void)name;
     }
@@ -50,10 +47,6 @@ struct BufferID {
     /// be observed.
     static BufferID getPlaceholder() { return BufferID(UINT32_MAX, ""sv); }
 
-#ifdef DEBUG
-    string_view name;
-#endif
-
 private:
     uint32_t id = 0;
 };
@@ -66,19 +59,12 @@ class SourceLocation {
 public:
     constexpr SourceLocation() : bufferID(0), charOffset(0) {}
     constexpr SourceLocation(BufferID buffer, size_t offset) :
-#ifdef DEBUG
-        bufferName(buffer.name),
-#endif
         bufferID(buffer.getId()), charOffset(offset) {
     }
 
     /// @return an identifier for the buffer that contains this location.
     BufferID buffer() const {
-#ifdef DEBUG
-        return BufferID(bufferID, bufferName);
-#else
         return BufferID(bufferID, ""sv);
-#endif
     }
 
     /// @return the character offset of this location within the source buffer.
@@ -121,10 +107,6 @@ public:
     }
 
     bool operator>=(const SourceLocation& rhs) const { return !(*this < rhs); }
-
-#ifdef DEBUG
-    string_view bufferName;
-#endif
 
     /// A location that is reserved to represent "no location" at all.
     static const SourceLocation NoLocation;
