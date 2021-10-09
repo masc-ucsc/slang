@@ -20,6 +20,7 @@ namespace slang {
 
 struct AssociativeArray;
 struct SVQueue;
+struct SVUnion;
 
 /// Represents an IEEE754 double precision floating point number.
 /// This is a separate type from `double` to make it less likely that
@@ -51,12 +52,17 @@ class ConstantValue {
 public:
     /// This type represents the null value (class handles, etc) in expressions.
     struct NullPlaceholder : std::monostate {};
+
+    /// This type represents the unbounded value ($) in expressions.
+    struct UnboundedPlaceholder : std::monostate {};
+
     using Elements = std::vector<ConstantValue>;
     using Map = CopyPtr<AssociativeArray>;
     using Queue = CopyPtr<SVQueue>;
+    using Union = CopyPtr<SVUnion>;
 
     using Variant = std::variant<std::monostate, SVInt, real_t, shortreal_t, NullPlaceholder,
-                                 Elements, std::string, Map, Queue>;
+                                 Elements, std::string, Map, Queue, Union, UnboundedPlaceholder>;
 
     ConstantValue() = default;
     ConstantValue(nullptr_t) {}
@@ -67,6 +73,7 @@ public:
     ConstantValue(shortreal_t real) : value(real) {}
 
     ConstantValue(NullPlaceholder nul) : value(nul) {}
+    ConstantValue(UnboundedPlaceholder unbounded) : value(unbounded) {}
     ConstantValue(const Elements& elements) : value(elements) {}
     ConstantValue(Elements&& elements) : value(std::move(elements)) {}
     ConstantValue(const std::string& str) : value(str) {}
@@ -82,6 +89,11 @@ public:
     ConstantValue(const SVQueue& queue) : value(Queue(queue)) {}
     ConstantValue(SVQueue&& queue) : value(Queue(std::move(queue))) {}
 
+    ConstantValue(const Union& unionVal) : value(unionVal) {}
+    ConstantValue(Union&& unionVal) : value(std::move(unionVal)) {}
+    ConstantValue(const SVUnion& unionVal) : value(Union(unionVal)) {}
+    ConstantValue(SVUnion&& unionVal) : value(Union(std::move(unionVal))) {}
+
     bool bad() const { return std::holds_alternative<std::monostate>(value); }
     explicit operator bool() const { return !bad(); }
 
@@ -89,10 +101,12 @@ public:
     bool isReal() const { return std::holds_alternative<real_t>(value); }
     bool isShortReal() const { return std::holds_alternative<shortreal_t>(value); }
     bool isNullHandle() const { return std::holds_alternative<NullPlaceholder>(value); }
+    bool isUnbounded() const { return std::holds_alternative<UnboundedPlaceholder>(value); }
     bool isUnpacked() const { return std::holds_alternative<Elements>(value); }
     bool isString() const { return std::holds_alternative<std::string>(value); }
     bool isMap() const { return std::holds_alternative<Map>(value); }
     bool isQueue() const { return std::holds_alternative<Queue>(value); }
+    bool isUnion() const { return std::holds_alternative<Union>(value); }
 
     bool isContainer() const { return isUnpacked() || isQueue() || isMap(); }
 
@@ -121,6 +135,11 @@ public:
     const Queue& queue() const& { return std::get<Queue>(value); }
     Queue queue() && { return std::get<Queue>(std::move(value)); }
     Queue queue() const&& { return std::get<Queue>(std::move(value)); }
+
+    Union& unionVal() & { return std::get<Union>(value); }
+    const Union& unionVal() const& { return std::get<Union>(value); }
+    Union unionVal() && { return std::get<Union>(std::move(value)); }
+    Union unionVal() const&& { return std::get<Union>(std::move(value)); }
 
     ConstantValue getSlice(int32_t upper, int32_t lower, const ConstantValue& defaultValue) const;
 
@@ -177,6 +196,12 @@ struct SVQueue : public std::deque<ConstantValue> {
         if (maxBound && size() > maxBound + 1)
             resize(maxBound + 1);
     }
+};
+
+/// Represents a SystemVerilog unpacked union, for use during constant evaluation.
+struct SVUnion {
+    ConstantValue value;
+    optional<uint32_t> activeMember;
 };
 
 /// An iterator for child elements in a ConstantValue, if it represents an

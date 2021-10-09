@@ -6,9 +6,8 @@
 //------------------------------------------------------------------------------
 #pragma once
 
-#include <tuple>
-
 #include <flat_hash_map.hpp>
+#include <tuple>
 
 #include "slang/binding/Lookup.h"
 #include "slang/numeric/ConstantValue.h"
@@ -30,6 +29,7 @@ struct ExpressionSyntax;
 struct PropertyExprSyntax;
 struct SelectorSyntax;
 struct VariableDimensionSyntax;
+enum class RandMode;
 
 /// Specifies flags that control expression and statement binding.
 enum class BindFlags {
@@ -92,29 +92,60 @@ enum class BindFlags {
     /// Expression is allowed to be the unbounded literal '$' such as inside a queue select.
     AllowUnboundedLiteral = 1 << 13,
 
-    /// Specparams are allowed even if this is also a constant expression.
-    SpecparamsAllowed = 1 << 14,
+    /// Expression is allowed to do arithmetic with an unbounded literal.
+    AllowUnboundedLiteralArithmetic = 1 << 14,
 
-    /// Binding is happening within a function body or a final block.
-    FunctionOrFinal = 1 << 15,
+    /// Specparams are allowed even if this is also a constant expression.
+    SpecparamsAllowed = 1 << 15,
+
+    /// Binding is happening within a function body
+    Function = 1 << 16,
+
+    /// Binding is happening within a final block.
+    Final = 1 << 17,
 
     /// Binding is happening within the intra-assignment timing control of
     /// a non-blocking assignment expression.
-    NonBlockingTimingControl = 1 << 16,
+    NonBlockingTimingControl = 1 << 18,
 
     /// Binding is happening within an event expression.
-    EventExpression = 1 << 17,
+    EventExpression = 1 << 19,
 
     /// Binding is in a context where type reference expressions are allowed.
-    AllowTypeReferences = 1 << 18,
+    AllowTypeReferences = 1 << 20,
 
     /// Binding is happening within an assertion expression (sequence or property).
-    AssertionExpr = 1 << 19,
+    AssertionExpr = 1 << 21,
 
     /// Allow binding a clocking block as part of a top-level event expression.
-    AllowClockingBlock = 1 << 20
+    AllowClockingBlock = 1 << 22,
+
+    /// Binding is for checking an assertion argument, prior to it being expanded as
+    /// part of an actual instance.
+    AssertionInstanceArgCheck = 1 << 23,
+
+    /// Binding is for a cycle delay or sequence repetition, where references to
+    /// assertion formal ports have specific type requirements.
+    AssertionDelayOrRepetition = 1 << 24,
+
+    /// Binding is for the left hand side of an assignment operation.
+    LValue = 1 << 25,
+
+    /// Binding is for the negation of a property, which disallows recursive
+    /// instantiations.
+    PropertyNegation = 1 << 26,
+
+    /// Binding is for a property that has come after a positive advancement
+    /// of time within the parent property definition.
+    PropertyTimeAdvance = 1 << 27,
+
+    /// Binding is for an argument passed to a recursive property instance.
+    RecursivePropertyArg = 1 << 28,
+
+    /// Binding is inside a concurrent assertion's action block.
+    ConcurrentAssertActionBlock = 1 << 29
 };
-BITMASK(BindFlags, AllowClockingBlock);
+BITMASK(BindFlags, ConcurrentAssertActionBlock);
 
 enum class DimensionKind { Unknown, Range, AbbreviatedRange, Dynamic, Associative, Queue };
 
@@ -158,27 +189,62 @@ public:
     const IteratorSymbol* firstIterator = nullptr;
 
     /// A collection of information needed to bind names inside inline constraint
-    /// blocks for class randomize function calls.
-    struct ClassRandomizeScope {
-        /// The scope of the class type itself.
+    /// blocks for class and scope randomize function calls.
+    struct RandomizeDetails {
+        /// The scope of the class type itself, if randomizing a class.
         const Scope* classType = nullptr;
 
         /// A list of names to which class-scoped lookups are restricted.
         /// If empty, the lookup is unrestricted and all names are first
         /// tried in class-scope.
         span<const string_view> nameRestrictions;
+
+        /// A set of variables for a scope randomize call that should be
+        /// treated as a rand variable.
+        flat_hash_set<const Symbol*> scopeRandVars;
     };
 
-    /// If this context is for binding an inline constraint block for a class randomize
-    /// function call, this points to information about the class scope. Name lookups
-    /// happen inside the class scope before going through the normal local lookup.
-    const ClassRandomizeScope* classRandomizeScope = nullptr;
+    /// If this context is for binding an inline constraint block for a randomize
+    /// function call, this points to information about the scope. Name lookups
+    /// happen inside the class scope before going through the normal local lookup,
+    /// for example.
+    const RandomizeDetails* randomizeDetails = nullptr;
 
     /// Information required to instantiate a sequence or property instance.
     struct AssertionInstanceDetails {
+        /// The assertion member being instantiated.
+        const Symbol* symbol = nullptr;
+
+        /// The previous binding context used to start the instantiation.
+        /// This effectively forms a linked list when expanding a nested
+        /// stack of sequence and property instances.
+        const BindContext* prevContext = nullptr;
+
+        /// The location where the instance is being instantiated.
+        SourceLocation instanceLoc;
+
         /// A map of formal argument symbols to their actual replacements.
         flat_hash_map<const Symbol*, std::tuple<const PropertyExprSyntax*, BindContext>>
             argumentMap;
+
+        /// A map of local variables declared in the assertion item.
+        /// These don't exist in any scope because their types can depend
+        /// on the expanded arguments.
+        flat_hash_map<string_view, const Symbol*> localVars;
+
+        /// If an argument to a sequence or property is being expanded, this
+        /// member contains the source location where the argument was referenced.
+        SourceLocation argExpansionLoc;
+
+        /// If an argument is being expanded, this is the context in which the
+        /// argument was originally being bound (as opposed to where it is being
+        /// expanded now).
+        const AssertionInstanceDetails* argDetails = nullptr;
+
+        /// Indicates whether this particular instance has already been seen
+        /// previously in the stack of assertion instances being expanded.
+        /// Only applicable to properties, since this is illegal for sequences.
+        bool isRecursive = false;
     };
 
     /// If this context is for binding an instantiation of a sequence or
@@ -195,6 +261,7 @@ public:
     Compilation& getCompilation() const;
     LookupLocation getLocation() const { return LookupLocation(scope, uint32_t(lookupIndex)); }
     bool inUnevaluatedBranch() const { return (flags & BindFlags::UnevaluatedBranch) != 0; }
+    bool isPortConnection() const;
 
     void setAttributes(const Statement& stmt,
                        span<const AttributeInstanceSyntax* const> syntax) const;
@@ -219,7 +286,8 @@ public:
     ConstantValue eval(const Expression& expr) const;
     ConstantValue tryEval(const Expression& expr) const;
 
-    optional<int32_t> evalInteger(const ExpressionSyntax& syntax) const;
+    optional<int32_t> evalInteger(const ExpressionSyntax& syntax,
+                                  bitmask<BindFlags> extraFlags = {}) const;
     optional<int32_t> evalInteger(const Expression& expr) const;
     EvaluatedDimension evalDimension(const VariableDimensionSyntax& syntax, bool requireRange,
                                      bool isPacked) const;
@@ -232,6 +300,15 @@ public:
     /// up front whether they will be used to instantiate a property or a sequence or are actually
     /// for a subroutine. This method unwraps for the case where we are calling a subroutine.
     const ExpressionSyntax* requireSimpleExpr(const PropertyExprSyntax& expr) const;
+    const ExpressionSyntax* requireSimpleExpr(const PropertyExprSyntax& expr, DiagCode code) const;
+
+    /// Gets the rand mode for the given symbol, taking into account any randomize
+    /// scope that may be active in this context.
+    RandMode getRandMode(const Symbol& symbol) const;
+
+    /// If this context is within an assertion instance, report a backtrace of how that
+    /// instance was expanded to the given diagnostic; otherwise, do nothing.
+    void addAssertionBacktrace(Diagnostic& diag) const;
 
     BindContext resetFlags(bitmask<BindFlags> addedFlags) const;
 

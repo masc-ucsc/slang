@@ -265,16 +265,17 @@ void NetSymbol::fromSyntax(const Scope& scope, const NetDeclarationSyntax& synta
     }
 }
 
-void NetSymbol::fromSyntax(const Scope& scope, const UserDefinedNetDeclarationSyntax& syntax,
-                           LookupLocation location, SmallVector<const NetSymbol*>& results) {
-    auto& comp = scope.getCompilation();
+void NetSymbol::fromSyntax(const BindContext& context,
+                           const UserDefinedNetDeclarationSyntax& syntax,
+                           SmallVector<const NetSymbol*>& results) {
+    auto& comp = context.getCompilation();
 
     const NetType* netType;
-    auto result =
-        Lookup::unqualifiedAt(scope, syntax.netType.valueText(), location, syntax.netType.range());
+    auto result = Lookup::unqualifiedAt(*context.scope, syntax.netType.valueText(),
+                                        context.getLocation(), syntax.netType.range());
 
     if (result && result->kind != SymbolKind::NetType) {
-        scope.addDiag(diag::VarDeclWithDelay, syntax.delay->sourceRange());
+        context.addDiag(diag::VarDeclWithDelay, syntax.delay->sourceRange());
         result = nullptr;
     }
 
@@ -291,7 +292,7 @@ void NetSymbol::fromSyntax(const Scope& scope, const UserDefinedNetDeclarationSy
                                            declarator->name.location(), *netType);
         net->getDeclaredType()->copyTypeFrom(declaredType);
         net->setFromDeclarator(*declarator);
-        net->setAttributes(scope, syntax.attributes);
+        net->setAttributes(*context.scope, syntax.attributes);
         results.append(net);
     }
 }
@@ -338,7 +339,7 @@ void NetSymbol::checkInitializer() const {
     // about user-defined nettypes, which is why we can't just do it in the parser.
     auto init = getInitializer();
     auto parent = getParentScope();
-    if (init && parent && parent->asSymbol().kind == SymbolKind::Package)
+    if (init && parent && parent->asSymbol().kind == SymbolKind::Package && !init->bad())
         parent->addDiag(diag::PackageNetInit, init->sourceRange);
 }
 
@@ -401,14 +402,13 @@ void ClockVarSymbol::fromSyntax(const Scope& scope, const ClockingItemSyntax& sy
     LookupLocation ll = LookupLocation::before(scope.asSymbol());
     BindContext context(*parent, ll);
 
-    ArgumentDirection dir;
+    ArgumentDirection dir = ArgumentDirection::In;
     ClockingSkew inputSkew, outputSkew;
     if (syntax.direction->input.kind == TokenKind::InOutKeyword) {
         dir = ArgumentDirection::InOut;
     }
     else {
         if (syntax.direction->input) {
-            dir = ArgumentDirection::In;
             if (syntax.direction->inputSkew)
                 inputSkew = ClockingSkew::fromSyntax(*syntax.direction->inputSkew, context);
         }
@@ -474,6 +474,29 @@ void ClockVarSymbol::serializeTo(ASTSerializer& serializer) const {
         serializer.startObject();
         outputSkew.serializeTo(serializer);
         serializer.endObject();
+    }
+}
+
+LocalAssertionVarSymbol::LocalAssertionVarSymbol(string_view name, SourceLocation loc) :
+    VariableSymbol(SymbolKind::LocalAssertionVar, name, loc, VariableLifetime::Automatic) {
+    getDeclaredType()->addFlags(DeclaredTypeFlags::RequireSequenceType);
+}
+
+void LocalAssertionVarSymbol::fromSyntax(const Scope& scope,
+                                         const LocalVariableDeclarationSyntax& syntax,
+                                         SmallVector<const LocalAssertionVarSymbol*>& results) {
+    auto& comp = scope.getCompilation();
+    for (auto declarator : syntax.declarators) {
+        auto var = comp.emplace<LocalAssertionVarSymbol>(declarator->name.valueText(),
+                                                         declarator->name.location());
+        var->setDeclaredType(*syntax.type);
+        var->setFromDeclarator(*declarator);
+        var->setAttributes(scope, syntax.attributes);
+        results.append(var);
+
+        // Local variables don't get added to any scope as members but
+        // we still need a parent pointer set so they can participate in lookups.
+        var->setParent(scope);
     }
 }
 

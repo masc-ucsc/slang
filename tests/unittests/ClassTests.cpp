@@ -109,7 +109,7 @@ class C;
     pure local function logic foo4;
     virtual static function foo5; endfunction
 
-    virtual int m;
+    pure virtual int m;
     static automatic int n;
     static var static int o;
 
@@ -1945,7 +1945,7 @@ endclass
 TEST_CASE("Constraint qualifiers") {
     auto tree = SyntaxTree::fromText(R"(
 class A;
-    virtual constraint c1 { 1; }
+    rand constraint c1 { 1; }
     pure constraint c2 { 1; }
 
     static constraint c3 { 1; }
@@ -2063,6 +2063,8 @@ package p;
     int i;
     class Base;
         typedef int IntT;
+        int bar;
+        function int baz; return 1; endfunction
     endclass
     class A extends Base;
         rand int j;
@@ -2079,6 +2081,7 @@ module m;
         k = a.randomize with (j, q, foo) { j < foo() + k; };
         k = a.randomize with { j + local::l < 10; };
         k = a.randomize with (j) { j + l < 10; };
+        k = a.randomize with { bar + baz(); };
     end
 endmodule
 
@@ -2121,6 +2124,24 @@ endclass
     CHECK(diags[6].code == diag::ExpectedVariableName);
     CHECK(diags[7].code == diag::InvalidRandType);
     CHECK(diags[8].code == diag::NameListWithScopeRandomize);
+}
+
+TEST_CASE("Scope randomize rand variables") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    int a, b;
+    initial begin
+        b = randomize(a) with {
+            a dist { 1 :/ 1, [9:2] :/ 9};
+            a inside {[9:1]};
+        };
+    end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
 }
 
 TEST_CASE("Local members in generic classes of same type") {
@@ -2196,6 +2217,98 @@ module m;
         c.f <= 3;
     end
 endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Class with randsequence") {
+    auto tree = SyntaxTree::fromText(R"(
+class C;
+    int x;
+    function foo;
+        randsequence( main )
+            main : first second third;
+            first : { x = x + 10; };
+            second : { if(x) break; } fourth;
+            third : { x = x + 10; };
+            fourth : { x = x + 15; };
+        endsequence
+    endfunction
+endclass
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Bit-slice of rand variable in dist constraint GH #437") {
+    auto tree = SyntaxTree::fromText(R"(
+class C;
+    rand bit [63:0] value;
+    constraint value_c {
+        value[63] dist {0 :/ 70, 1 :/ 30};
+        value[0] == 1'b0;
+        value[15:8] inside {
+            8'h0,
+            8'hF
+        };
+    }
+    function new();
+    endfunction
+endclass
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Class overriding inherited enumerand") {
+    auto tree = SyntaxTree::fromText(R"(
+class A;
+    typedef enum { FOO, BAR } e1;
+endclass
+
+class B extends A;
+    typedef enum { BAR, BAZ } e2;
+endclass
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Extern method default arg protected member") {
+    auto tree = SyntaxTree::fromText(R"(
+class C;
+    protected static int unsigned _val = 100;
+    extern virtual function void set_val(int unsigned new_val = _val);
+    virtual function void set_val2(int unsigned new_val = _val);
+    endfunction
+endclass
+function void C::set_val(int unsigned new_val = _val);
+endfunction
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Virtual interface property with qualifiers") {
+    auto tree = SyntaxTree::fromText(R"(
+interface intf();
+endinterface
+class A;
+    protected virtual intf _my_intf;
+    function new();
+    endfunction
+endclass
 )");
 
     Compilation compilation;

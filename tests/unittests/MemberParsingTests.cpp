@@ -668,7 +668,15 @@ module m;
     default clocking cb_checker;
     always @(s_f)
       $display("sequence triggered");
+
     a4: assert property (a |=> in1);
+
+    function bit next_window (bit win);
+        if (reset || win && end_flag)
+            return 1'b0;
+    endfunction
+
+    rand const bit [$bits(in_data)-1:0] mem_data;
   endchecker : check
 endmodule
 )";
@@ -836,6 +844,33 @@ covergroup g1 (int w, string instComment) @(posedge clk) ;
     b : coverpoint b_var { option.weight = w; }
     c1 : cross a_var, b_var ;
 endgroup
+
+covergroup sg @(posedge clk);
+  coverpoint v
+  {
+    bins b2 = (2 [-> 3:5] );
+    bins b3 = (3[-> 3:5] );
+    bins b5 = (5 [* 3] );
+    bins b6 = (1 => 2 [= 3:6] => 5);
+  }
+endgroup
+)";
+
+    parseCompilationUnit(text);
+    CHECK_DIAGNOSTICS_EMPTY;
+}
+
+TEST_CASE("Package-scoped checker instance parsing") {
+    auto& text = R"(
+package p;
+    checker c; endchecker
+endpackage
+
+checker c1; p::c foo(); endchecker
+
+module m;
+    $unit::c1 bar();
+endmodule
 )";
 
     parseCompilationUnit(text);

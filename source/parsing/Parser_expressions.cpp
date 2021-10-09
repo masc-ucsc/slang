@@ -61,10 +61,14 @@ ExpressionSyntax& Parser::parseSubExpression(bitmask<ExpressionOptions> options,
         return parsePostfixExpression(expr, options);
     }
     else if (current.kind == TokenKind::TaggedKeyword) {
-        // TODO: check for trailing expression
         auto tagged = consume();
         auto member = expect(TokenKind::Identifier);
-        return factory.taggedUnionExpression(tagged, member, nullptr);
+
+        ExpressionSyntax* expr = nullptr;
+        if (isPossibleExpression(peek().kind))
+            expr = &parseExpression();
+
+        return factory.taggedUnionExpression(tagged, member, expr);
     }
 
     ExpressionSyntax* leftOperand;
@@ -309,9 +313,9 @@ OpenRangeListSyntax& Parser::parseOpenRangeList() {
     return factory.openRangeList(openBrace, list, closeBrace);
 }
 
-ExpressionSyntax& Parser::parseOpenRangeElement() {
+ExpressionSyntax& Parser::parseOpenRangeElement(bitmask<ExpressionOptions> options) {
     if (!peek(TokenKind::OpenBracket))
-        return parseExpression();
+        return parseSubExpression(options, 0);
 
     auto openBracket = consume();
     auto& left = parseExpression();
@@ -610,6 +614,9 @@ NameSyntax& Parser::parseName(bitmask<NameOptions> options) {
                                                                        << "."sv;
         }
 
+        if (kind == TokenKind::DoubleColon && name->kind == SyntaxKind::IdentifierName)
+            meta.classPackageNames.append(&name->as<IdentifierNameSyntax>());
+
         switch (previousKind) {
             case SyntaxKind::UnitScope:
             case SyntaxKind::LocalScope:
@@ -721,27 +728,50 @@ NameSyntax& Parser::parseNamePart(bitmask<NameOptions> options) {
             return factory.className(identifier, *parameterValues);
         }
         case TokenKind::OpenBracket: {
-            if (options.has(NameOptions::SequenceExpr) && isSequenceRepetition())
-                return factory.identifierName(identifier);
-
-            uint32_t index = 1;
-            scanTypePart<isSemicolon>(index, TokenKind::OpenBracket, TokenKind::CloseBracket);
-            if (!options.has(NameOptions::ForeachName) ||
-                peek(index).kind != TokenKind::CloseParenthesis) {
-
+            if (options.has(NameOptions::ForeachName)) {
+                // For a foreach loop declaration, the final selector
+                // brackets need to be parsed specially because they declare
+                // loop variable names. All the selectors prior can be
+                // parsed as normal selectors.
                 SmallVectorSized<ElementSelectSyntax*, 4> buffer;
                 do {
+                    uint32_t index = 1;
+                    scanTypePart<isSemicolon>(index, TokenKind::OpenBracket,
+                                              TokenKind::CloseBracket);
+                    if (peek(index).kind != TokenKind::OpenBracket &&
+                        peek(index).kind != TokenKind::Dot) {
+                        break;
+                    }
+
+                    buffer.append(&parseElementSelect());
+                } while (peek(TokenKind::OpenBracket));
+
+                if (buffer.empty())
+                    return factory.identifierName(identifier);
+
+                return factory.identifierSelectName(identifier, buffer.copy(alloc));
+            }
+            else {
+                SmallVectorSized<ElementSelectSyntax*, 4> buffer;
+                do {
+                    // Inside a sequence expression this could be a repetition directive
+                    // instead of a selection.
+                    if (options.has(NameOptions::SequenceExpr) && isSequenceRepetition()) {
+                        if (buffer.empty())
+                            return factory.identifierName(identifier);
+                        else
+                            return factory.identifierSelectName(identifier, buffer.copy(alloc));
+                    }
+
                     buffer.append(&parseElementSelect());
                 } while (peek(TokenKind::OpenBracket));
 
                 return factory.identifierSelectName(identifier, buffer.copy(alloc));
             }
-            else {
-                return factory.identifierName(identifier);
-            }
         }
-        default:
+        default: {
             return factory.identifierName(identifier);
+        }
     }
 }
 
@@ -813,6 +843,12 @@ ArgumentSyntax& Parser::parseArgument() {
 
 PatternSyntax& Parser::parsePattern() {
     switch (peek().kind) {
+        case TokenKind::OpenParenthesis: {
+            auto openParen = consume();
+            auto& pattern = parsePattern();
+            return factory.parenthesizedPattern(openParen, pattern,
+                                                expect(TokenKind::CloseParenthesis));
+        }
         case TokenKind::DotStar:
             return factory.wildcardPattern(consume());
         case TokenKind::Dot: {
@@ -822,18 +858,47 @@ PatternSyntax& Parser::parsePattern() {
         case TokenKind::TaggedKeyword: {
             auto tagged = consume();
             auto name = expect(TokenKind::Identifier);
-            // TODO: optional trailing pattern
-            return factory.taggedPattern(tagged, name, nullptr);
+
+            PatternSyntax* pattern = nullptr;
+            if (isPossiblePattern(peek().kind))
+                pattern = &parsePattern();
+
+            return factory.taggedPattern(tagged, name, pattern);
         }
-        case TokenKind::ApostropheOpenBrace:
-            // TODO: assignment pattern
-            break;
+        case TokenKind::ApostropheOpenBrace: {
+            auto openBrace = consume();
+            Token closeBrace;
+            SmallVectorSized<TokenOrSyntax, 4> buffer;
+
+            if (peek(TokenKind::Identifier) && peek(1).kind == TokenKind::Colon) {
+                parseList<isIdentifierOrComma, isCloseBrace>(
+                    buffer, TokenKind::CloseBrace, TokenKind::Comma, closeBrace, RequireItems::True,
+                    diag::ExpectedPattern, [this]() { return &parseMemberPattern(); });
+            }
+            else {
+                parseList<isPossiblePatternOrComma, isCloseBrace>(
+                    buffer, TokenKind::CloseBrace, TokenKind::Comma, closeBrace, RequireItems::True,
+                    diag::ExpectedPattern, [this]() {
+                        auto& pattern = parsePattern();
+                        return &factory.orderedStructurePatternMember(pattern);
+                    });
+            }
+
+            return factory.structurePattern(openBrace, buffer.copy(alloc), closeBrace);
+        }
         default:
             break;
     }
 
     // otherwise, it's either an expression or an error (parseExpression will handle that for us)
     return factory.expressionPattern(parseSubExpression(ExpressionOptions::PatternContext, 0));
+}
+
+StructurePatternMemberSyntax& Parser::parseMemberPattern() {
+    auto name = expect(TokenKind::Identifier);
+    auto colon = expect(TokenKind::Colon);
+    auto& pattern = parsePattern();
+    return factory.namedStructurePatternMember(name, colon, pattern);
 }
 
 ConditionalPredicateSyntax& Parser::parseConditionalPredicate(ExpressionSyntax& first,
@@ -873,27 +938,49 @@ ConditionalPatternSyntax& Parser::parseConditionalPattern() {
     return factory.conditionalPattern(expr, matchesClause);
 }
 
+EventExpressionSyntax& Parser::parseSignalEvent() {
+    Token edge = parseEdgeKeyword();
+    auto& expr = parseExpression();
+
+    IffEventClauseSyntax* iffClause = nullptr;
+    if (peek(TokenKind::IffKeyword)) {
+        auto iff = consume();
+        auto& iffExpr = parseExpression();
+        iffClause = &factory.iffEventClause(iff, iffExpr);
+    }
+
+    return factory.signalEventExpression(edge, expr, iffClause);
+}
+
 EventExpressionSyntax& Parser::parseEventExpression() {
-    EventExpressionSyntax* left;
+    EventExpressionSyntax* left = nullptr;
     auto kind = peek().kind;
     if (kind == TokenKind::OpenParenthesis) {
         auto openParen = consume();
         auto& expr = parseEventExpression();
         auto closeParen = expect(TokenKind::CloseParenthesis);
-        left = &factory.parenthesizedEventExpression(openParen, expr, closeParen);
-    }
-    else {
-        Token edge = parseEdgeKeyword();
-        auto& expr = parseExpression();
 
-        IffEventClauseSyntax* iffClause = nullptr;
-        if (peek(TokenKind::IffKeyword)) {
-            auto iff = consume();
-            auto& iffExpr = parseExpression();
-            iffClause = &factory.iffEventClause(iff, iffExpr);
+        // If the event expression turns out to be interpretable as a simple expression,
+        // treat it as such. This is necessary because the next token coming up might
+        // be part of a larger binary expression (the opening paren here is ambiguous).
+        if (expr.kind == SyntaxKind::SignalEventExpression) {
+            auto& see = expr.as<SignalEventExpressionSyntax>();
+            if (!see.edge && !see.iffClause) {
+                ExpressionSyntax* newExpr =
+                    &factory.parenthesizedExpression(openParen, *see.expr, closeParen);
+
+                newExpr = &parsePostfixExpression(*newExpr, ExpressionOptions::None);
+                newExpr = &parseBinaryExpression(newExpr, ExpressionOptions::None, 0);
+
+                left = &factory.signalEventExpression(Token(), *newExpr, nullptr);
+            }
         }
 
-        left = &factory.signalEventExpression(edge, expr, iffClause);
+        if (!left)
+            left = &factory.parenthesizedEventExpression(openParen, expr, closeParen);
+    }
+    else {
+        left = &parseSignalEvent();
     }
 
     kind = peek().kind;
@@ -1184,9 +1271,9 @@ SequenceMatchListSyntax* Parser::parseSequenceMatchList(Token& closeParen) {
 
     Token comma;
     span<TokenOrSyntax> list;
-    parseList<isPossibleExpressionOrComma, isEndOfParenList>(
+    parseList<isPossibleArgument, isEndOfParenList>(
         TokenKind::Comma, TokenKind::CloseParenthesis, TokenKind::Comma, comma, list, closeParen,
-        RequireItems::True, diag::ExpectedExpression, [this] { return &parseExpression(); });
+        RequireItems::True, diag::ExpectedExpression, [this] { return &parsePropertyExpr(0); });
 
     return &factory.sequenceMatchList(comma, list);
 }
@@ -1287,6 +1374,10 @@ SequenceExprSyntax& Parser::parseSequencePrimary() {
             auto& expr = parseSequenceExpr(0, /* isInProperty */ false);
             return parseParenthesizedSeqExpr(openParen, expr);
         }
+        case TokenKind::EdgeKeyword:
+        case TokenKind::NegEdgeKeyword:
+        case TokenKind::PosEdgeKeyword:
+            return parseSignalEvent();
         default: {
             auto& expr = parseExpressionOrDist(ExpressionOptions::SequenceExpr);
             auto repetition = parseSequenceRepetition();
@@ -1331,15 +1422,6 @@ SequenceExprSyntax& Parser::parseBinarySequenceExpr(SequenceExprSyntax* left, in
 
         // take the operator
         auto opToken = consume();
-
-        // Enforce the rule that the lhs of a throughout expr must be a simple
-        // (non-sequence) expression.
-        if (opKind == SyntaxKind::ThroughoutSequenceExpr &&
-            (left->kind != SyntaxKind::SimpleSequenceExpr ||
-             left->as<SimpleSequenceExprSyntax>().repetition)) {
-            addDiag(diag::ThroughoutLhsInvalid, opToken.location()) << left->sourceRange();
-        }
-
         auto& right = parseSequenceExpr(newPrecedence, isInProperty);
         left = &factory.binarySequenceExpr(opKind, *left, opToken, right);
     }
@@ -1442,8 +1524,16 @@ PropertyExprSyntax& Parser::parsePropertyPrimary() {
                 return factory.simplePropertyExpr(*result);
             }
 
-            auto closeParen = expect(TokenKind::CloseParenthesis);
-            return factory.parenthesizedPropertyExpr(openParen, expr, closeParen);
+            // In a parenthesized property expression a comma is not valid here. However,
+            // when parsing a property instance argument, we may be looking at an event
+            // expression here. The first term of an event expression may be an `iff`
+            // expression that gets parsed as a property expression, and we want to allow
+            // a comma separated list of events to follow. Binding will disambiguate this
+            // later when we learn what kind of expression we're actually being used in.
+            Token closeParen;
+            auto matchList = parseSequenceMatchList(closeParen);
+
+            return factory.parenthesizedPropertyExpr(openParen, expr, matchList, closeParen);
         }
         case TokenKind::StrongKeyword:
         case TokenKind::WeakKeyword: {
@@ -1568,15 +1658,6 @@ PropertyExprSyntax& Parser::parsePropertyExpr(int precedence) {
 
         // take the operator
         auto opToken = consume();
-
-        // Enforce that the lhs of implication / followed-by ops are sequence exprs.
-        if ((opKind == SyntaxKind::ImplicationPropertyExpr ||
-             opKind == SyntaxKind::FollowedByPropertyExpr) &&
-            left->kind != SyntaxKind::SimplePropertyExpr) {
-            addDiag(diag::PropertyLhsInvalid, opToken.location())
-                << left->sourceRange() << opToken.valueText();
-        }
-
         auto& right = parsePropertyExpr(newPrecedence);
 
         // If this could have been an 'and' or 'or' sequence expression, convert it into that

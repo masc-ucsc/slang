@@ -17,6 +17,7 @@
 #include "slang/diagnostics/DeclarationsDiags.h"
 #include "slang/diagnostics/ExpressionsDiags.h"
 #include "slang/diagnostics/LookupDiags.h"
+#include "slang/diagnostics/TypesDiags.h"
 #include "slang/symbols/ASTSerializer.h"
 #include "slang/symbols/ASTVisitor.h"
 #include "slang/symbols/CompilationUnitSymbols.h"
@@ -59,6 +60,14 @@ const PackageSymbol* ExplicitImportSymbol::package() const {
     return package_;
 }
 
+static const PackageSymbol* findPackage(string_view packageName, const Scope& lookupScope,
+                                        SourceLocation errorLoc) {
+    auto package = lookupScope.getCompilation().getPackage(packageName);
+    if (!package && !packageName.empty())
+        lookupScope.addDiag(diag::UnknownPackage, errorLoc) << packageName;
+    return package;
+}
+
 const Symbol* ExplicitImportSymbol::importedSymbol() const {
     if (!initialized) {
         initialized = true;
@@ -66,36 +75,44 @@ const Symbol* ExplicitImportSymbol::importedSymbol() const {
         const Scope* scope = getParentScope();
         ASSERT(scope);
 
-        if (packageName.empty())
+        auto loc = location;
+        if (auto syntax = getSyntax())
+            loc = syntax->as<PackageImportItemSyntax>().package.location();
+
+        package_ = findPackage(packageName, *scope, loc);
+        if (!package_)
             return nullptr;
 
-        package_ = scope->getCompilation().getPackage(packageName);
-        if (!package_) {
-            auto loc = location;
-            if (auto syntax = getSyntax(); syntax)
-                loc = syntax->as<PackageImportItemSyntax>().package.location();
-
-            scope->addDiag(diag::UnknownPackage, loc) << packageName;
-        }
-        else if (importName.empty()) {
-            return nullptr;
-        }
-        else {
-            import = package_->find(importName);
-            if (!import) {
-                auto loc = location;
+        import = package_->findForImport(importName);
+        if (!import) {
+            if (!importName.empty()) {
+                loc = location;
                 if (auto syntax = getSyntax())
                     loc = syntax->as<PackageImportItemSyntax>().item.location();
 
                 auto& diag = scope->addDiag(diag::UnknownPackageMember, loc);
-                diag << importName << packageName;
+                diag << importName << name;
             }
+        }
+        else {
+            // If we are doing this lookup from a scope that is within a package declaration
+            // we should note that fact so that it can later be exported if desired.
+            do {
+                auto& sym = scope->asSymbol();
+                if (sym.kind == SymbolKind::Package) {
+                    sym.as<PackageSymbol>().noteImport(*import);
+                    break;
+                }
+
+                scope = sym.getParentScope();
+            } while (scope);
         }
     }
     return import;
 }
 
 void ExplicitImportSymbol::serializeTo(ASTSerializer& serializer) const {
+    serializer.write("isFromExport", isFromExport);
     if (auto pkg = package())
         serializer.writeLink("package", *pkg);
 
@@ -112,24 +129,17 @@ const PackageSymbol* WildcardImportSymbol::getPackage() const {
         const Scope* scope = getParentScope();
         ASSERT(scope);
 
-        if (packageName.empty()) {
-            package = nullptr;
-        }
-        else {
-            package = scope->getCompilation().getPackage(packageName);
-            if (!package.value()) {
-                auto loc = location;
-                if (auto syntax = getSyntax(); syntax)
-                    loc = syntax->as<PackageImportItemSyntax>().package.location();
+        auto loc = location;
+        if (auto syntax = getSyntax(); syntax)
+            loc = syntax->as<PackageImportItemSyntax>().package.location();
 
-                scope->addDiag(diag::UnknownPackage, loc) << packageName;
-            }
-        }
+        package = findPackage(packageName, *scope, loc);
     }
     return *package;
 }
 
 void WildcardImportSymbol::serializeTo(ASTSerializer& serializer) const {
+    serializer.write("isFromExport", isFromExport);
     if (auto pkg = getPackage())
         serializer.writeLink("package", *pkg);
 }
@@ -140,25 +150,26 @@ ModportPortSymbol::ModportPortSymbol(string_view name, SourceLocation loc,
     direction(direction) {
 }
 
-ModportPortSymbol& ModportPortSymbol::fromSyntax(const Scope& parent, LookupLocation lookupLocation,
+ModportPortSymbol& ModportPortSymbol::fromSyntax(const BindContext& context,
                                                  ArgumentDirection direction,
                                                  const ModportNamedPortSyntax& syntax) {
-    auto& comp = parent.getCompilation();
+    auto& comp = context.getCompilation();
     auto name = syntax.name;
     auto result = comp.emplace<ModportPortSymbol>(name.valueText(), name.location(), direction);
     result->setSyntax(syntax);
-    result->internalSymbol = Lookup::unqualifiedAt(parent, name.valueText(), lookupLocation,
-                                                   name.range(), LookupFlags::NoParentScope);
+    result->internalSymbol =
+        Lookup::unqualifiedAt(*context.scope, name.valueText(), context.getLocation(), name.range(),
+                              LookupFlags::NoParentScope);
 
     if (result->internalSymbol) {
         if (result->internalSymbol->kind == SymbolKind::Subroutine) {
-            auto& diag = parent.addDiag(diag::ExpectedImportExport, name.range());
+            auto& diag = context.addDiag(diag::ExpectedImportExport, name.range());
             diag << name.valueText();
             diag.addNote(diag::NoteDeclarationHere, result->internalSymbol->location);
             result->internalSymbol = nullptr;
         }
         else if (!SemanticFacts::isAllowedInModport(result->internalSymbol->kind)) {
-            auto& diag = parent.addDiag(diag::NotAllowedInModport, name.range());
+            auto& diag = context.addDiag(diag::NotAllowedInModport, name.range());
             diag << name.valueText();
             diag.addNote(diag::NoteDeclarationHere, result->internalSymbol->location);
             result->internalSymbol = nullptr;
@@ -180,19 +191,47 @@ void ModportPortSymbol::serializeTo(ASTSerializer& serializer) const {
         serializer.writeLink("internalSymbol", *internalSymbol);
 }
 
+ModportClockingSymbol::ModportClockingSymbol(string_view name, SourceLocation loc) :
+    Symbol(SymbolKind::ModportClocking, name, loc) {
+}
+
+ModportClockingSymbol& ModportClockingSymbol::fromSyntax(const BindContext& context,
+                                                         const ModportClockingPortSyntax& syntax) {
+    auto& comp = context.getCompilation();
+    auto name = syntax.name;
+    auto result = comp.emplace<ModportClockingSymbol>(name.valueText(), name.location());
+    result->setSyntax(syntax);
+
+    result->target = Lookup::unqualifiedAt(*context.scope, name.valueText(), context.getLocation(),
+                                           name.range(), LookupFlags::NoParentScope);
+
+    if (result->target && result->target->kind != SymbolKind::ClockingBlock) {
+        auto& diag = context.addDiag(diag::NotAClockingBlock, name.range());
+        diag << name.valueText();
+        diag.addNote(diag::NoteDeclarationHere, result->target->location);
+        result->target = nullptr;
+    }
+
+    return *result;
+}
+
+void ModportClockingSymbol::serializeTo(ASTSerializer& serializer) const {
+    if (target)
+        serializer.writeLink("target", *target);
+}
+
 ModportSymbol::ModportSymbol(Compilation& compilation, string_view name, SourceLocation loc) :
     Symbol(SymbolKind::Modport, name, loc), Scope(compilation, this) {
 }
 
-void ModportSymbol::fromSyntax(const Scope& parent, const ModportDeclarationSyntax& syntax,
-                               LookupLocation lookupLocation,
+void ModportSymbol::fromSyntax(const BindContext& context, const ModportDeclarationSyntax& syntax,
                                SmallVector<const ModportSymbol*>& results) {
-    auto& comp = parent.getCompilation();
+    auto& comp = context.getCompilation();
     for (auto item : syntax.items) {
         auto modport =
             comp.emplace<ModportSymbol>(comp, item->name.valueText(), item->name.location());
         modport->setSyntax(*item);
-        modport->setAttributes(parent, syntax.attributes);
+        modport->setAttributes(*context.scope, syntax.attributes);
         results.append(modport);
 
         for (auto port : item->ports->ports) {
@@ -204,14 +243,13 @@ void ModportSymbol::fromSyntax(const Scope& parent, const ModportDeclarationSynt
                         switch (simplePort->kind) {
                             case SyntaxKind::ModportNamedPort: {
                                 auto& mpp = ModportPortSymbol::fromSyntax(
-                                    parent, lookupLocation, direction,
-                                    simplePort->as<ModportNamedPortSyntax>());
+                                    context, direction, simplePort->as<ModportNamedPortSyntax>());
                                 mpp.setAttributes(*modport, portList.attributes);
                                 modport->addMember(mpp);
                                 break;
                             }
                             case SyntaxKind::ModportExplicitPort:
-                                parent.addDiag(diag::NotYetSupported, simplePort->sourceRange());
+                                context.addDiag(diag::NotYetSupported, simplePort->sourceRange());
                                 break;
                             default:
                                 THROW_UNREACHABLE;
@@ -229,15 +267,14 @@ void ModportSymbol::fromSyntax(const Scope& parent, const ModportDeclarationSynt
                             switch (subPort->kind) {
                                 case SyntaxKind::ModportNamedPort: {
                                     auto& mps = MethodPrototypeSymbol::fromSyntax(
-                                        parent, lookupLocation,
-                                        subPort->as<ModportNamedPortSyntax>());
+                                        context, subPort->as<ModportNamedPortSyntax>());
                                     mps.setAttributes(*modport, portList.attributes);
                                     modport->addMember(mps);
                                     break;
                                 }
                                 case SyntaxKind::ModportSubroutinePort: {
                                     auto& mps = MethodPrototypeSymbol::fromSyntax(
-                                        parent, subPort->as<ModportSubroutinePortSyntax>());
+                                        *context.scope, subPort->as<ModportSubroutinePortSyntax>());
                                     mps.setAttributes(*modport, portList.attributes);
                                     modport->addMember(mps);
                                     break;
@@ -249,11 +286,16 @@ void ModportSymbol::fromSyntax(const Scope& parent, const ModportDeclarationSynt
                     }
                     break;
                 }
-                case SyntaxKind::ModportClockingPort:
-                    parent.addDiag(diag::NotYetSupported, port->sourceRange());
+                case SyntaxKind::ModportClockingPort: {
+                    auto& clockingPort = port->as<ModportClockingPortSyntax>();
+                    auto& mcs = ModportClockingSymbol::fromSyntax(context, clockingPort);
+                    mcs.setAttributes(*modport, clockingPort.attributes);
+                    modport->addMember(mcs);
                     break;
-                default:
+                }
+                default: {
                     THROW_UNREACHABLE;
+                }
             }
         }
     }
@@ -270,12 +312,12 @@ ContinuousAssignSymbol::ContinuousAssignSymbol(SourceLocation loc, const Express
 }
 
 void ContinuousAssignSymbol::fromSyntax(Compilation& compilation,
-                                        const ContinuousAssignSyntax& syntax, const Scope& scope,
-                                        LookupLocation location,
+                                        const ContinuousAssignSyntax& syntax,
+                                        const BindContext& parentContext,
                                         SmallVector<const Symbol*>& results,
                                         SmallVector<const Symbol*>& implicitNets) {
-    BindContext context(scope, location, BindFlags::NonProcedural);
-    auto& netType = scope.getDefaultNetType();
+    BindContext context = parentContext.resetFlags(BindFlags::NonProcedural);
+    auto& netType = context.scope->getDefaultNetType();
 
     for (auto expr : syntax.assignments) {
         // If not explicitly disabled, check for net references on the lhs of each
@@ -297,7 +339,7 @@ void ContinuousAssignSymbol::fromSyntax(Compilation& compilation,
         }
 
         auto symbol = compilation.emplace<ContinuousAssignSymbol>(*expr);
-        symbol->setAttributes(scope, syntax.attributes);
+        symbol->setAttributes(*context.scope, syntax.attributes);
         results.append(symbol);
     }
 }
@@ -322,23 +364,28 @@ struct ExpressionVarVisitor {
 
     template<typename T>
     void visit(const T& expr) {
-        switch (expr.kind) {
-            case ExpressionKind::NamedValue:
-            case ExpressionKind::HierarchicalValue: {
-                if (auto sym = expr.getSymbolReference()) {
-                    if (VariableSymbol::isKind(sym->kind))
-                        anyVars = true;
+        if constexpr (std::is_base_of_v<Expression, T>) {
+            switch (expr.kind) {
+                case ExpressionKind::NamedValue:
+                case ExpressionKind::HierarchicalValue: {
+                    if (auto sym = expr.getSymbolReference()) {
+                        if (VariableSymbol::isKind(sym->kind))
+                            anyVars = true;
+                    }
+                    break;
                 }
-                break;
+                default:
+                    if constexpr (is_detected_v<ASTDetectors::visitExprs_t, T,
+                                                ExpressionVarVisitor>) {
+                        expr.visitExprs(*this);
+                    }
+                    break;
             }
-            default:
-                if constexpr (is_detected_v<ASTDetectors::visitExprs_t, T, ExpressionVarVisitor>)
-                    expr.visitExprs(*this);
-                break;
         }
     }
 
     void visitInvalid(const Expression&) {}
+    void visitInvalid(const AssertionExpr&) {}
 };
 
 const TimingControl* ContinuousAssignSymbol::getDelay() const {
@@ -410,7 +457,7 @@ ElabSystemTaskSymbol::ElabSystemTaskSymbol(ElabSystemTaskKind taskKind, SourceLo
 ElabSystemTaskSymbol& ElabSystemTaskSymbol::fromSyntax(Compilation& compilation,
                                                        const ElabSystemTaskSyntax& syntax) {
     // Just create the symbol now. The diagnostic will be issued later
-    // when someone visit the symbol and asks for it.
+    // when someone visits the symbol and asks for it.
     auto taskKind = SemanticFacts::getElabSystemTaskKind(syntax.name);
     auto result = compilation.emplace<ElabSystemTaskSymbol>(taskKind, syntax.name.location());
     result->setSyntax(syntax);
@@ -482,6 +529,8 @@ string_view ElabSystemTaskSymbol::getMessage() const {
     // Format the message to string.
     EvalContext evalCtx(comp);
     optional<std::string> str = FmtHelpers::formatDisplay(*scope, evalCtx, argSpan);
+    evalCtx.reportDiags(bindCtx);
+
     if (!str)
         return empty();
 
@@ -810,8 +859,9 @@ void AssertionPortSymbol::buildPorts(Scope& scope, const AssertionItemPortListSy
     auto& comp = scope.getCompilation();
     auto& untyped = comp.getType(SyntaxKind::Untyped);
     const DataTypeSyntax* lastType = nullptr;
+    optional<ArgumentDirection> lastLocalDir;
+
     for (auto item : syntax.ports) {
-        // TODO: local / direction
         auto port =
             comp.emplace<AssertionPortSymbol>(item->name.valueText(), item->name.location());
         port->setSyntax(*item);
@@ -820,27 +870,80 @@ void AssertionPortSymbol::buildPorts(Scope& scope, const AssertionItemPortListSy
         if (!item->dimensions.empty())
             port->declaredType.setDimensionSyntax(item->dimensions);
 
+        if (item->local) {
+            port->localVarDirection = item->direction
+                                          ? SemanticFacts::getDirection(item->direction.kind)
+                                          : ArgumentDirection::In;
+
+            // If we have a local keyword we can never inherit the previous type.
+            lastType = nullptr;
+
+            if (scope.asSymbol().kind == SymbolKind::Property &&
+                port->localVarDirection != ArgumentDirection::In) {
+                scope.addDiag(diag::AssertionPortPropOutput, item->direction.range());
+            }
+        }
+
         if (isEmpty(*item->type)) {
             if (lastType)
                 port->declaredType.setTypeSyntax(*lastType);
-            else
+            else {
                 port->declaredType.setType(untyped);
+                if (!item->dimensions.empty()) {
+                    scope.addDiag(diag::InvalidArrayElemType, item->dimensions.sourceRange())
+                        << untyped;
+                }
+
+                if (item->local && scope.asSymbol().kind != SymbolKind::LetDecl)
+                    scope.addDiag(diag::LocalVarTypeRequired, item->local.range());
+            }
+
+            if (!item->local)
+                port->localVarDirection = lastLocalDir;
         }
         else {
             port->declaredType.setTypeSyntax(*item->type);
             lastType = item->type;
+
+            // Ports of type 'property' are not allowed in sequences,
+            // and let declarations cannot have ports of type 'sequence' or 'property'.
+            auto itemKind = item->type->kind;
+            if (itemKind == SyntaxKind::PropertyType &&
+                scope.asSymbol().kind == SymbolKind::Sequence) {
+                scope.addDiag(diag::PropertyPortInSeq, item->type->sourceRange());
+            }
+            else if ((itemKind == SyntaxKind::PropertyType ||
+                      itemKind == SyntaxKind::SequenceType) &&
+                     scope.asSymbol().kind == SymbolKind::LetDecl) {
+                scope.addDiag(diag::PropertyPortInLet, item->type->sourceRange())
+                    << item->type->getFirstToken().valueText();
+            }
         }
 
-        if (item->defaultValue)
-            port->defaultValueSyntax = item->defaultValue->expr;
+        lastLocalDir = port->localVarDirection;
+        if (item->defaultValue) {
+            if (port->localVarDirection == ArgumentDirection::Out ||
+                port->localVarDirection == ArgumentDirection::InOut) {
+                scope.addDiag(diag::AssertionPortOutputDefault,
+                              item->defaultValue->expr->sourceRange());
+            }
+            else {
+                port->defaultValueSyntax = item->defaultValue->expr;
+            }
+        }
+
+        if (port->localVarDirection) {
+            port->declaredType.addFlags(DeclaredTypeFlags::RequireSequenceType);
+        }
 
         scope.addMember(*port);
         results.append(port);
     }
 }
 
-void AssertionPortSymbol::serializeTo(ASTSerializer&) const {
-    // TODO:
+void AssertionPortSymbol::serializeTo(ASTSerializer& serializer) const {
+    if (localVarDirection)
+        serializer.write("localVarDirection", toString(*localVarDirection));
 }
 
 SequenceSymbol::SequenceSymbol(Compilation& compilation, string_view name, SourceLocation loc) :
@@ -849,7 +952,6 @@ SequenceSymbol::SequenceSymbol(Compilation& compilation, string_view name, Sourc
 
 SequenceSymbol& SequenceSymbol::fromSyntax(const Scope& scope,
                                            const SequenceDeclarationSyntax& syntax) {
-    // TODO: fill in body
     auto& comp = scope.getCompilation();
     auto result =
         comp.emplace<SequenceSymbol>(comp, syntax.name.valueText(), syntax.name.location());
@@ -858,13 +960,13 @@ SequenceSymbol& SequenceSymbol::fromSyntax(const Scope& scope,
     SmallVectorSized<const AssertionPortSymbol*, 4> ports;
     if (syntax.portList)
         AssertionPortSymbol::buildPorts(*result, *syntax.portList, ports);
-
     result->ports = ports.copy(comp);
+
     return *result;
 }
 
-void SequenceSymbol::serializeTo(ASTSerializer&) const {
-    // TODO:
+void SequenceSymbol::makeDefaultInstance() const {
+    AssertionInstanceExpression::makeDefault(*this);
 }
 
 PropertySymbol::PropertySymbol(Compilation& compilation, string_view name, SourceLocation loc) :
@@ -873,7 +975,6 @@ PropertySymbol::PropertySymbol(Compilation& compilation, string_view name, Sourc
 
 PropertySymbol& PropertySymbol::fromSyntax(const Scope& scope,
                                            const PropertyDeclarationSyntax& syntax) {
-    // TODO: fill in body
     auto& comp = scope.getCompilation();
     auto result =
         comp.emplace<PropertySymbol>(comp, syntax.name.valueText(), syntax.name.location());
@@ -882,13 +983,37 @@ PropertySymbol& PropertySymbol::fromSyntax(const Scope& scope,
     SmallVectorSized<const AssertionPortSymbol*, 4> ports;
     if (syntax.portList)
         AssertionPortSymbol::buildPorts(*result, *syntax.portList, ports);
-
     result->ports = ports.copy(comp);
+
     return *result;
 }
 
-void PropertySymbol::serializeTo(ASTSerializer&) const {
-    // TODO:
+void PropertySymbol::makeDefaultInstance() const {
+    AssertionInstanceExpression::makeDefault(*this);
+}
+
+LetDeclSymbol::LetDeclSymbol(Compilation& compilation, const ExpressionSyntax& exprSyntax,
+                             string_view name, SourceLocation loc) :
+    Symbol(SymbolKind::LetDecl, name, loc),
+    Scope(compilation, this), exprSyntax(&exprSyntax) {
+}
+
+LetDeclSymbol& LetDeclSymbol::fromSyntax(const Scope& scope, const LetDeclarationSyntax& syntax) {
+    auto& comp = scope.getCompilation();
+    auto result = comp.emplace<LetDeclSymbol>(comp, *syntax.expr, syntax.identifier.valueText(),
+                                              syntax.identifier.location());
+    result->setSyntax(syntax);
+
+    SmallVectorSized<const AssertionPortSymbol*, 4> ports;
+    if (syntax.portList)
+        AssertionPortSymbol::buildPorts(*result, *syntax.portList, ports);
+    result->ports = ports.copy(comp);
+
+    return *result;
+}
+
+void LetDeclSymbol::makeDefaultInstance() const {
+    AssertionInstanceExpression::makeDefault(*this);
 }
 
 ClockingBlockSymbol::ClockingBlockSymbol(Compilation& compilation, string_view name,
@@ -1014,6 +1139,402 @@ void ClockingBlockSymbol::serializeTo(ASTSerializer& serializer) const {
         skew.serializeTo(serializer);
         serializer.endObject();
     }
+}
+
+RandSeqProductionSymbol::RandSeqProductionSymbol(Compilation& compilation, string_view name,
+                                                 SourceLocation loc) :
+    Symbol(SymbolKind::RandSeqProduction, name, loc),
+    Scope(compilation, this), declaredReturnType(*this) {
+}
+
+RandSeqProductionSymbol& RandSeqProductionSymbol::fromSyntax(Compilation& compilation,
+                                                             const ProductionSyntax& syntax) {
+    auto result = compilation.emplace<RandSeqProductionSymbol>(compilation, syntax.name.valueText(),
+                                                               syntax.name.location());
+    result->setSyntax(syntax);
+
+    if (syntax.dataType)
+        result->declaredReturnType.setTypeSyntax(*syntax.dataType);
+    else
+        result->declaredReturnType.setType(compilation.getVoidType());
+
+    if (syntax.portList) {
+        SmallVectorSized<const FormalArgumentSymbol*, 8> args;
+        SubroutineSymbol::buildArguments(*result, *syntax.portList, VariableLifetime::Automatic,
+                                         args);
+        result->arguments = args.copy(compilation);
+    }
+
+    for (auto rule : syntax.rules) {
+        auto& ruleBlock = StatementBlockSymbol::fromSyntax(*result, *rule);
+        result->addMember(ruleBlock);
+    }
+
+    return *result;
+}
+
+span<const RandSeqProductionSymbol::Rule> RandSeqProductionSymbol::getRules() const {
+    if (!rules) {
+        auto syntax = getSyntax();
+        ASSERT(syntax);
+
+        BindContext context(*this, LookupLocation::max);
+
+        auto blocks = membersOfType<StatementBlockSymbol>();
+        auto blockIt = blocks.begin();
+
+        SmallVectorSized<Rule, 8> buffer;
+        for (auto rule : syntax->as<ProductionSyntax>().rules) {
+            ASSERT(blockIt != blocks.end());
+            buffer.append(createRule(*rule, context, *blockIt++));
+        }
+
+        rules = buffer.copy(context.getCompilation());
+    }
+    return *rules;
+}
+
+const RandSeqProductionSymbol* RandSeqProductionSymbol::findProduction(string_view name,
+                                                                       SourceRange nameRange,
+                                                                       const BindContext& context) {
+    auto symbol = Lookup::unqualifiedAt(*context.scope, name, context.getLocation(), nameRange,
+                                        LookupFlags::AllowDeclaredAfter);
+    if (!symbol)
+        return nullptr;
+
+    if (symbol->kind != SymbolKind::RandSeqProduction) {
+        auto& diag = context.addDiag(diag::NotAProduction, nameRange) << name;
+        diag.addNote(diag::NoteDeclarationHere, symbol->location);
+        return nullptr;
+    }
+
+    return &symbol->as<RandSeqProductionSymbol>();
+}
+
+RandSeqProductionSymbol::ProdItem RandSeqProductionSymbol::createProdItem(
+    const RsProdItemSyntax& syntax, const BindContext& context) {
+
+    auto symbol = findProduction(syntax.name.valueText(), syntax.name.range(), context);
+    if (!symbol)
+        return ProdItem(nullptr, {});
+
+    SmallVectorSized<const Expression*, 8> args;
+    CallExpression::bindArgs(syntax.argList, symbol->arguments, symbol->name, syntax.sourceRange(),
+                             context, args);
+
+    return ProdItem(symbol, args.copy(context.getCompilation()));
+}
+
+const RandSeqProductionSymbol::CaseProd& RandSeqProductionSymbol::createCaseProd(
+    const RsCaseSyntax& syntax, const BindContext& context) {
+
+    SmallVectorSized<const ExpressionSyntax*, 8> expressions;
+    SmallVectorSized<ProdItem, 8> prods;
+    optional<ProdItem> defItem;
+
+    for (auto item : syntax.items) {
+        switch (item->kind) {
+            case SyntaxKind::StandardRsCaseItem: {
+                auto& sci = item->as<StandardRsCaseItemSyntax>();
+                auto pi = createProdItem(*sci.item, context);
+                for (auto es : sci.expressions) {
+                    expressions.append(es);
+                    prods.append(pi);
+                }
+                break;
+            }
+            case SyntaxKind::DefaultRsCaseItem:
+                // The parser already errored for duplicate defaults,
+                // so just ignore if it happens here.
+                if (!defItem)
+                    defItem = createProdItem(*item->as<DefaultRsCaseItemSyntax>().item, context);
+                break;
+            default:
+                THROW_UNREACHABLE;
+        }
+    }
+
+    SmallVectorSized<const Expression*, 8> bound;
+    Expression::bindMembershipExpressions(context, TokenKind::CaseKeyword,
+                                          /* requireIntegral */ false,
+                                          /* unwrapUnpacked */ false,
+                                          /* allowTypeReferences */ true, /* allowOpenRange */ true,
+                                          *syntax.expr, expressions, bound);
+
+    SmallVectorSized<CaseItem, 8> items;
+    SmallVectorSized<const Expression*, 8> group;
+    auto& comp = context.getCompilation();
+    auto boundIt = bound.begin();
+    auto prodIt = prods.begin();
+    auto expr = *boundIt++;
+
+    for (auto item : syntax.items) {
+        switch (item->kind) {
+            case SyntaxKind::StandardRsCaseItem: {
+                auto& sci = item->as<StandardRsCaseItemSyntax>();
+                for (size_t i = 0; i < sci.expressions.size(); i++)
+                    group.append(*boundIt++);
+
+                items.append({ group.copy(comp), *prodIt++ });
+                group.clear();
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    return *comp.emplace<CaseProd>(*expr, items.copy(comp), defItem);
+}
+
+RandSeqProductionSymbol::Rule RandSeqProductionSymbol::createRule(
+    const RsRuleSyntax& syntax, const BindContext& context, const StatementBlockSymbol& ruleBlock) {
+
+    auto blockRange = ruleBlock.membersOfType<StatementBlockSymbol>();
+    auto blockIt = blockRange.begin();
+
+    auto& comp = context.getCompilation();
+    SmallVectorSized<const ProdBase*, 8> prods;
+    for (auto p : syntax.prods) {
+        switch (p->kind) {
+            case SyntaxKind::RsProdItem:
+                prods.append(
+                    comp.emplace<ProdItem>(createProdItem(p->as<RsProdItemSyntax>(), context)));
+                break;
+            case SyntaxKind::RsCodeBlock: {
+                ASSERT(blockIt != blockRange.end());
+                prods.append(comp.emplace<CodeBlockProd>(*blockIt++));
+                break;
+            }
+            case SyntaxKind::RsIfElse: {
+                auto& ries = p->as<RsIfElseSyntax>();
+                auto& expr = Expression::bind(*ries.condition, context);
+                auto ifItem = createProdItem(*ries.ifItem, context);
+
+                optional<ProdItem> elseItem;
+                if (ries.elseClause)
+                    elseItem = createProdItem(*ries.elseClause->item, context);
+
+                if (!expr.bad())
+                    context.requireBooleanConvertible(expr);
+
+                prods.append(comp.emplace<IfElseProd>(expr, ifItem, elseItem));
+                break;
+            }
+            case SyntaxKind::RsRepeat: {
+                auto& rrs = p->as<RsRepeatSyntax>();
+                auto& expr = Expression::bind(*rrs.expr, context);
+                auto item = createProdItem(*rrs.item, context);
+                prods.append(comp.emplace<RepeatProd>(expr, item));
+
+                if (!expr.bad() && !expr.type->isIntegral())
+                    context.addDiag(diag::ExprMustBeIntegral, expr.sourceRange) << *expr.type;
+
+                break;
+            }
+            case SyntaxKind::RsCase:
+                prods.append(&createCaseProd(p->as<RsCaseSyntax>(), context));
+                break;
+            default:
+                THROW_UNREACHABLE;
+        }
+    }
+
+    const Expression* weightExpr = nullptr;
+    optional<CodeBlockProd> codeBlock;
+    if (auto wc = syntax.weightClause) {
+        weightExpr = &Expression::bind(*wc->weight, context);
+        if (!weightExpr->bad() && !weightExpr->type->isIntegral())
+            context.addDiag(diag::ExprMustBeIntegral, weightExpr->sourceRange) << *weightExpr->type;
+
+        if (wc->codeBlock) {
+            ASSERT(blockIt != blockRange.end());
+            codeBlock = CodeBlockProd(*blockIt++);
+        }
+    }
+
+    bool isRandJoin = false;
+    const Expression* randJoinExpr = nullptr;
+    if (syntax.randJoin) {
+        isRandJoin = true;
+        if (syntax.randJoin->expr) {
+            randJoinExpr = &Expression::bind(*syntax.randJoin->expr, context);
+
+            if (!randJoinExpr->bad() && !randJoinExpr->type->isNumeric()) {
+                context.addDiag(diag::RandJoinNotNumeric, randJoinExpr->sourceRange)
+                    << *randJoinExpr->type;
+            }
+        }
+    }
+
+    return { ruleBlock, prods.copy(comp), weightExpr, randJoinExpr, codeBlock, isRandJoin };
+}
+
+void RandSeqProductionSymbol::createRuleVariables(const RsRuleSyntax& syntax, const Scope& scope,
+                                                  SmallVector<const Symbol*>& results) {
+    SmallMap<const RandSeqProductionSymbol*, uint32_t, 8> prodMap;
+    auto countProd = [&](const RsProdItemSyntax& item) {
+        auto symbol =
+            Lookup::unqualified(scope, item.name.valueText(), LookupFlags::AllowDeclaredAfter);
+        if (symbol && symbol->kind == SymbolKind::RandSeqProduction) {
+            auto& prod = symbol->as<RandSeqProductionSymbol>();
+            auto& type = prod.getReturnType();
+            if (!type.isVoid()) {
+                auto [it, inserted] = prodMap.emplace(&prod, 1);
+                if (!inserted)
+                    it->second++;
+            }
+        }
+    };
+
+    for (auto p : syntax.prods) {
+        switch (p->kind) {
+            case SyntaxKind::RsProdItem:
+                countProd(p->as<RsProdItemSyntax>());
+                break;
+            case SyntaxKind::RsCodeBlock:
+                break;
+            case SyntaxKind::RsIfElse: {
+                auto& ries = p->as<RsIfElseSyntax>();
+                countProd(*ries.ifItem);
+                if (ries.elseClause)
+                    countProd(*ries.elseClause->item);
+                break;
+            }
+            case SyntaxKind::RsRepeat:
+                countProd(*p->as<RsRepeatSyntax>().item);
+                break;
+            case SyntaxKind::RsCase:
+                for (auto item : p->as<RsCaseSyntax>().items) {
+                    switch (item->kind) {
+                        case SyntaxKind::StandardRsCaseItem:
+                            countProd(*item->as<StandardRsCaseItemSyntax>().item);
+                            break;
+                        case SyntaxKind::DefaultRsCaseItem:
+                            countProd(*item->as<DefaultRsCaseItemSyntax>().item);
+                            break;
+                        default:
+                            THROW_UNREACHABLE;
+                    }
+                }
+                break;
+            default:
+                THROW_UNREACHABLE;
+        }
+    }
+
+    auto& comp = scope.getCompilation();
+    for (auto [symbol, count] : prodMap) {
+        auto var = comp.emplace<VariableSymbol>(symbol->name, syntax.getFirstToken().location(),
+                                                VariableLifetime::Automatic);
+        var->isCompilerGenerated = true;
+        var->isConstant = true;
+
+        if (count == 1) {
+            var->setType(symbol->getReturnType());
+        }
+        else {
+            ConstantRange range{ 1, int32_t(count) };
+            var->setType(
+                FixedSizeUnpackedArrayType::fromDims(comp, symbol->getReturnType(), { &range, 1 }));
+        }
+
+        results.append(var);
+    }
+}
+
+void RandSeqProductionSymbol::serializeTo(ASTSerializer& serializer) const {
+    auto writeItem = [&](string_view propName, const ProdItem& item) {
+        serializer.writeProperty(propName);
+        serializer.startObject();
+        if (item.target)
+            serializer.writeLink("target", *item.target);
+
+        serializer.startArray("args");
+        for (auto arg : item.args)
+            serializer.serialize(*arg);
+        serializer.endArray();
+
+        serializer.endObject();
+    };
+
+    serializer.write("returnType", getReturnType());
+
+    serializer.startArray("arguments");
+    for (auto arg : arguments)
+        serializer.serialize(*arg);
+    serializer.endArray();
+
+    serializer.startArray("rules");
+    for (auto& rule : getRules()) {
+        serializer.startObject();
+
+        serializer.startArray("prods");
+        for (auto prod : rule.prods) {
+            serializer.startObject();
+            switch (prod->kind) {
+                case ProdKind::Item:
+                    serializer.write("kind", "Item"sv);
+                    writeItem("item", *(const ProdItem*)prod);
+                    break;
+                case ProdKind::CodeBlock:
+                    serializer.write("kind", "CodeBlock"sv);
+                    break;
+                case ProdKind::IfElse: {
+                    auto& iep = *(const IfElseProd*)prod;
+                    serializer.write("kind", "IfElse"sv);
+                    serializer.write("expr", *iep.expr);
+
+                    writeItem("ifItem", iep.ifItem);
+                    if (iep.elseItem)
+                        writeItem("elseItem", *iep.elseItem);
+                    break;
+                }
+                case ProdKind::Repeat: {
+                    auto& rp = *(const RepeatProd*)prod;
+                    serializer.write("kind", "Repeat"sv);
+                    serializer.write("expr", *rp.expr);
+                    writeItem("item", rp.item);
+                    break;
+                }
+                case ProdKind::Case: {
+                    auto& cp = *(const CaseProd*)prod;
+                    serializer.write("kind", "Case"sv);
+                    serializer.write("expr", *cp.expr);
+                    if (cp.defaultItem)
+                        writeItem("defaultItem", *cp.defaultItem);
+
+                    serializer.startArray("items");
+                    for (auto& item : cp.items) {
+                        serializer.startObject();
+                        serializer.startArray("expressions");
+                        for (auto expr : item.expressions)
+                            serializer.serialize(*expr);
+                        serializer.endArray();
+
+                        writeItem("item", item.item);
+                        serializer.endObject();
+                    }
+                    serializer.endArray();
+                    break;
+                }
+                default:
+                    THROW_UNREACHABLE;
+            }
+            serializer.endObject();
+        }
+        serializer.endArray();
+
+        if (rule.weightExpr)
+            serializer.write("weightExpr", *rule.weightExpr);
+
+        serializer.write("isRandJoin", rule.isRandJoin);
+        if (rule.randJoinExpr)
+            serializer.write("randJoinExpr", *rule.randJoinExpr);
+
+        serializer.endObject();
+    }
+    serializer.endArray();
 }
 
 } // namespace slang

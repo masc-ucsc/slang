@@ -72,12 +72,18 @@ enum class DeclaredTypeFlags {
     /// the expression is otherwise not constant.
     SpecparamsAllowed = 1 << 11,
 
+    /// Allow use of the unbounded literal '$' in the initializer expression.
+    AllowUnboundedLiteral = 1 << 12,
+
+    /// The type must be one allowed in a sequence expression.
+    RequireSequenceType = 1 << 13,
+
     /// A mask of flags that indicate additional type rules are needed to
     /// be checked after the type itself is resolved.
-    NeedsTypeCheck =
-        Port | NetType | UserDefinedNetType | FormalArgMergeVar | Rand | DPIReturnType | DPIArg
+    NeedsTypeCheck = Port | NetType | UserDefinedNetType | FormalArgMergeVar | Rand |
+                     DPIReturnType | DPIArg | RequireSequenceType
 };
-BITMASK(DeclaredTypeFlags, SpecparamsAllowed);
+BITMASK(DeclaredTypeFlags, RequireSequenceType);
 
 /// Ties together various syntax nodes that declare the type of some parent symbol
 /// along with the logic necessary to resolve that type. Optionally includes an
@@ -177,14 +183,17 @@ public:
     /// initializer information.
     void copyTypeFrom(const DeclaredType& source);
 
-    /// Forces resolution of type (and the initializer as well if applicable) using the
-    /// given bind context, which could differ from the normal binding context that
-    /// would otherwise be used for resolution.
+    /// Resolves the initializer using the given bind context, which could
+    /// differ from the binding context that is used for type resolution.
     void resolveAt(const BindContext& context) const;
+
+    /// Forces resolution of both the type and the initializer using the given bind context
+    /// instead of using the normal logic built into DeclaredType to determine the context.
+    void forceResolveAt(const BindContext& context) const;
 
 private:
     const Scope& getScope() const;
-    void resolveType(const BindContext& initializerContext) const;
+    void resolveType(const BindContext& typeContext, const BindContext& initializerContext) const;
     void checkType(const BindContext& context) const;
     void mergePortTypes(const BindContext& context, const ValueSymbol& sourceSymbol,
                         const ImplicitTypeSyntax& implicit, SourceLocation location,

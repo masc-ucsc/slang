@@ -6,6 +6,7 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "slang/binding/Expression.h"
 #include "slang/symbols/ASTSerializer.h"
 #include "slang/symbols/SemanticFacts.h"
 #include "slang/util/Util.h"
@@ -29,18 +30,21 @@ ENUM(TimingControlKind, CONTROL);
 
 class BindContext;
 class Compilation;
-class Expression;
+struct PropertyExprSyntax;
+struct SequenceExprSyntax;
 struct TimingControlSyntax;
 
 class TimingControl {
 public:
     TimingControlKind kind;
 
-    const TimingControlSyntax* syntax = nullptr;
+    const SyntaxNode* syntax = nullptr;
 
     bool bad() const { return kind == TimingControlKind::Invalid; }
 
-    static const TimingControl& bind(const TimingControlSyntax& syntax, const BindContext& context);
+    static TimingControl& bind(const TimingControlSyntax& syntax, const BindContext& context);
+    static TimingControl& bind(const PropertyExprSyntax& syntax, const BindContext& context);
+    static TimingControl& bind(const SequenceExprSyntax& syntax, const BindContext& context);
 
     template<typename T>
     T& as() {
@@ -95,6 +99,11 @@ public:
     static bool isKind(TimingControlKind kind) { return kind == TimingControlKind::Delay; }
 
     void serializeTo(ASTSerializer& serializer) const;
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        expr.visit(visitor);
+    }
 };
 
 struct Delay3Syntax;
@@ -118,10 +127,21 @@ public:
     static bool isKind(TimingControlKind kind) { return kind == TimingControlKind::Delay3; }
 
     void serializeTo(ASTSerializer& serializer) const;
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        expr1.visit(visitor);
+        if (expr2)
+            expr2->visit(visitor);
+        if (expr3)
+            expr3->visit(visitor);
+    }
 };
 
+struct BinaryPropertyExprSyntax;
 struct EventControlSyntax;
 struct SignalEventExpressionSyntax;
+struct SimpleSequenceExprSyntax;
 
 class SignalEventControl : public TimingControl {
 public:
@@ -140,9 +160,24 @@ public:
     static TimingControl& fromSyntax(Compilation& compilation, const EventControlSyntax& syntax,
                                      const BindContext& context);
 
+    static TimingControl& fromSyntax(Compilation& compilation,
+                                     const BinaryPropertyExprSyntax& syntax,
+                                     const BindContext& context);
+
+    static TimingControl& fromSyntax(Compilation& compilation,
+                                     const SimpleSequenceExprSyntax& syntax,
+                                     const BindContext& context);
+
     static bool isKind(TimingControlKind kind) { return kind == TimingControlKind::SignalEvent; }
 
     void serializeTo(ASTSerializer& serializer) const;
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        expr.visit(visitor);
+        if (iffCondition)
+            iffCondition->visit(visitor);
+    }
 
 private:
     static TimingControl& fromExpr(Compilation& compilation, EdgeKind edge, const Expression& expr,
@@ -158,12 +193,18 @@ public:
     explicit EventListControl(span<const TimingControl* const> events) :
         TimingControl(TimingControlKind::EventList), events(events) {}
 
-    static TimingControl& fromSyntax(Compilation& compilation, const EventExpressionSyntax& syntax,
+    static TimingControl& fromSyntax(Compilation& compilation, const SyntaxNode& syntax,
                                      const BindContext& context);
 
     static bool isKind(TimingControlKind kind) { return kind == TimingControlKind::EventList; }
 
     void serializeTo(ASTSerializer& serializer) const;
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        for (auto ev : events)
+            ev->visit(visitor);
+    }
 };
 
 struct ImplicitEventControlSyntax;
@@ -198,6 +239,12 @@ public:
     static bool isKind(TimingControlKind kind) { return kind == TimingControlKind::RepeatedEvent; }
 
     void serializeTo(ASTSerializer& serializer) const;
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        expr.visit(visitor);
+        event.visit(visitor);
+    }
 };
 
 class OneStepDelayControl : public TimingControl {
@@ -222,6 +269,11 @@ public:
     static bool isKind(TimingControlKind kind) { return kind == TimingControlKind::CycleDelay; }
 
     void serializeTo(ASTSerializer& serializer) const;
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        expr.visit(visitor);
+    }
 };
 
 } // namespace slang

@@ -66,6 +66,7 @@ enum class RandMode;
     x(InterfacePort) \
     x(Modport) \
     x(ModportPort) \
+    x(ModportClocking) \
     x(Instance) \
     x(InstanceBody) \
     x(InstanceArray) \
@@ -101,7 +102,10 @@ enum class RandMode;
     x(Property) \
     x(AssertionPort) \
     x(ClockingBlock) \
-    x(ClockVar)
+    x(ClockVar) \
+    x(LocalAssertionVar) \
+    x(LetDecl) \
+    x(RandSeqProduction)
 // clang-format on
 
 ENUM(SymbolKind, SYMBOLKIND)

@@ -7,6 +7,9 @@ empty
 TimingControl final=false
 empty
 
+SequenceExpr final=false
+empty
+
 PropertyExpr final=false
 empty
 
@@ -82,6 +85,11 @@ token closeParen
 
 Pattern final=false
 empty
+
+ParenthesizedPattern base=Pattern
+token openParen
+Pattern pattern
+token closeParen
 
 VariablePattern base=Pattern
 token dot
@@ -421,7 +429,7 @@ IffEventClause
 token iff
 Expression expr
 
-EventExpression final=false
+EventExpression base=SequenceExpr final=false
 empty
 
 SignalEventExpression base=EventExpression
@@ -1217,13 +1225,13 @@ EmptyPortConnection base=PortConnection
 token placeholder
 
 OrderedPortConnection base=PortConnection
-Expression expr
+PropertyExpr expr
 
 NamedPortConnection base=PortConnection
 token dot
 token name
 token openParen
-Expression? expr
+PropertyExpr? expr
 token closeParen
 
 WildcardPortConnection base=PortConnection
@@ -1251,6 +1259,15 @@ NetStrength? strength
 TimingControl? delay
 separated_list<HierarchicalInstance> instances
 token semi
+
+CheckerInstantiation base=Member
+Name type
+ParameterValueAssignment? parameters
+separated_list<HierarchicalInstance> instances
+token semi
+
+CheckerInstanceStatement base=Statement
+CheckerInstantiation instance
 
 BindTargetList
 token colon
@@ -1899,9 +1916,6 @@ token semi
 
 // ----- ASSERTIONS -----
 
-SequenceExpr final=false
-empty
-
 SequenceRepetition
 token openBracket
 token op
@@ -1914,7 +1928,7 @@ SequenceRepetition? repetition
 
 SequenceMatchList
 token comma
-separated_list<Expression> items
+separated_list<PropertyExpr> items
 
 ParenthesizedSequenceExpr base=SequenceExpr
 token openParen
@@ -1962,6 +1976,7 @@ SequenceExpr expr
 ParenthesizedPropertyExpr base=PropertyExpr
 token openParen
 PropertyExpr expr
+SequenceMatchList? matchList
 token closeParen
 
 StrongWeakPropertyExpr base=PropertyExpr
@@ -2037,12 +2052,18 @@ token closeParen
 list<PropertyCaseItem> items
 token endcase
 
+LocalVariableDeclaration base=Member
+token var
+DataType type
+separated_list<Declarator> declarators
+token semi
+
 PropertyDeclaration base=Member
 token keyword
 token name
 AssertionItemPortList? portList
 token semi
-list<Member> variables
+list<LocalVariableDeclaration> variables
 PropertySpec propertySpec
 token optionalSemi
 token end
@@ -2053,7 +2074,7 @@ token keyword
 token name
 AssertionItemPortList? portList
 token semi
-list<Member> variables
+list<LocalVariableDeclaration> variables
 SequenceExpr seqExpr
 token optionalSemi
 token end
@@ -2067,6 +2088,10 @@ token semi
 list<Member> members
 token end
 NamedBlockClause? endBlockName
+
+CheckerDataDeclaration base=Member
+token rand
+DataDeclaration data
 
 // ----- TOP LEVEL -----
 

@@ -48,7 +48,8 @@ bool ParameterSymbolBase::hasDefault() const {
 
 ParameterSymbol::ParameterSymbol(string_view name, SourceLocation loc, bool isLocal, bool isPort) :
     ValueSymbol(SymbolKind::Parameter, name, loc,
-                DeclaredTypeFlags::InferImplicit | DeclaredTypeFlags::RequireConstant),
+                DeclaredTypeFlags::InferImplicit | DeclaredTypeFlags::RequireConstant |
+                    DeclaredTypeFlags::AllowUnboundedLiteral),
     ParameterSymbolBase(*this, isLocal, isPort) {
 }
 
@@ -241,7 +242,7 @@ TypeParameterSymbol& TypeParameterSymbol::fromDecl(const Definition::ParameterDe
             auto namedType = comp.emplace<NamedTypeSyntax>(nameSyntax);
 
             tt.setTypeSyntax(*namedType);
-            tt.setType(comp.getType(*namedType, context.getLocation(), *context.scope));
+            tt.setType(comp.getType(*namedType, context));
         }
         else if (!DataTypeSyntax::isKind(newInitializer->kind)) {
             context.addDiag(diag::BadTypeParamExpr, newInitializer->getFirstToken().location())
@@ -249,8 +250,7 @@ TypeParameterSymbol& TypeParameterSymbol::fromDecl(const Definition::ParameterDe
         }
         else {
             tt.setTypeSyntax(newInitializer->as<DataTypeSyntax>());
-            tt.setType(comp.getType(newInitializer->as<DataTypeSyntax>(), context.getLocation(),
-                                    *context.scope));
+            tt.setType(comp.getType(newInitializer->as<DataTypeSyntax>(), context));
         }
     }
 
@@ -366,10 +366,14 @@ void DefParamSymbol::resolve() const {
     auto declType = param.getDeclaredType();
     auto typeSyntax = declType->getTypeSyntax();
 
-    if (typeSyntax && typeSyntax->kind == SyntaxKind::ImplicitType)
-        initializer = &Expression::bindImplicitParam(*typeSyntax, expr, equalsLoc, context);
-    else
+    if (typeSyntax && typeSyntax->kind == SyntaxKind::ImplicitType) {
+        BindContext typeContext(*param.getParentScope(), LookupLocation::before(param));
+        initializer =
+            &Expression::bindImplicitParam(*typeSyntax, expr, equalsLoc, context, typeContext);
+    }
+    else {
         initializer = &Expression::bindRValue(declType->getType(), expr, equalsLoc, context);
+    }
 
     context.eval(*initializer);
     if (!initializer->constant)
@@ -389,18 +393,22 @@ SpecparamSymbol::SpecparamSymbol(string_view name, SourceLocation loc) :
 }
 
 const ConstantValue& SpecparamSymbol::getValue() const {
-    auto init = getDeclaredType()->getInitializer();
-    ASSERT(init);
+    if (!value) {
+        // If no value has been explicitly set, try to set it
+        // from our initializer.
+        auto init = getInitializer();
+        if (init) {
+            auto scope = getParentScope();
+            ASSERT(scope);
 
-    if (!init->constant) {
-        auto scope = getParentScope();
-        ASSERT(scope);
-
-        BindContext context(*scope, LookupLocation::before(*this));
-        context.eval(*init);
+            BindContext ctx(*scope, LookupLocation::before(*this));
+            value = scope->getCompilation().allocConstant(ctx.eval(*init));
+        }
+        else {
+            value = &ConstantValue::Invalid;
+        }
     }
-
-    return *init->constant;
+    return *value;
 }
 
 void SpecparamSymbol::fromSyntax(const Scope& scope, const SpecparamDeclarationSyntax& syntax,

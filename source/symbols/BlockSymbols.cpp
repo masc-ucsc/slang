@@ -13,6 +13,7 @@
 #include "slang/diagnostics/LookupDiags.h"
 #include "slang/diagnostics/StatementsDiags.h"
 #include "slang/symbols/ASTSerializer.h"
+#include "slang/symbols/MemberSymbols.h"
 #include "slang/symbols/ParameterSymbols.h"
 #include "slang/symbols/SubroutineSymbols.h"
 #include "slang/symbols/VariableSymbols.h"
@@ -52,7 +53,8 @@ StatementBlockSymbol& StatementBlockSymbol::fromSyntax(const Scope& scope,
     }
 
     StatementBlockKind blockKind = SemanticFacts::getStatementBlockKind(syntax);
-    if (flags.has(StatementFlags::FuncOrFinal) && !flags.has(StatementFlags::InForkJoinNone)) {
+    if ((flags.has(StatementFlags::Func | StatementFlags::Final)) &&
+        !flags.has(StatementFlags::InForkJoinNone)) {
         // fork-join and fork-join_any blocks are not allowed in functions, so check that here.
         if (blockKind == StatementBlockKind::JoinAll || blockKind == StatementBlockKind::JoinAny)
             scope.addDiag(diag::TimingInFuncNotAllowed, syntax.end.range());
@@ -127,6 +129,62 @@ StatementBlockSymbol& StatementBlockSymbol::fromSyntax(const Scope& scope,
     return *result;
 }
 
+StatementBlockSymbol& StatementBlockSymbol::fromSyntax(const Scope& scope,
+                                                       const RandSequenceStatementSyntax& syntax) {
+    auto [name, loc] = getLabel(syntax, syntax.randsequence.location());
+    auto result = createBlock(scope, syntax, name, loc, StatementFlags::AutoLifetime);
+
+    auto& comp = scope.getCompilation();
+    for (auto prod : syntax.productions) {
+        if (prod->name.valueText().empty())
+            continue;
+
+        auto& symbol = RandSeqProductionSymbol::fromSyntax(comp, *prod);
+        result->addMember(symbol);
+    }
+
+    result->binder.setSyntax(*result, syntax, /* labelHandled */ true, StatementFlags::None);
+    for (auto block : result->binder.getBlocks())
+        result->addMember(*block);
+
+    return *result;
+}
+
+StatementBlockSymbol& StatementBlockSymbol::fromSyntax(const Scope& scope,
+                                                       const RsRuleSyntax& syntax) {
+    auto& comp = scope.getCompilation();
+    auto result = comp.emplace<StatementBlockSymbol>(comp, ""sv, syntax.getFirstToken().location(),
+                                                     StatementBlockKind::Sequential,
+                                                     VariableLifetime::Automatic);
+    result->setSyntax(syntax);
+    result->setNeedElaboration();
+
+    for (auto prod : syntax.prods) {
+        if (prod->kind == SyntaxKind::RsCodeBlock) {
+            result->addMember(
+                StatementBlockSymbol::fromSyntax(scope, prod->as<RsCodeBlockSyntax>()));
+        }
+
+        if (syntax.weightClause && syntax.weightClause->codeBlock) {
+            result->addMember(StatementBlockSymbol::fromSyntax(
+                scope, syntax.weightClause->codeBlock->as<RsCodeBlockSyntax>()));
+        }
+    }
+
+    return *result;
+}
+
+StatementBlockSymbol& StatementBlockSymbol::fromSyntax(const Scope& scope,
+                                                       const RsCodeBlockSyntax& syntax) {
+    auto& comp = scope.getCompilation();
+    auto result = comp.emplace<StatementBlockSymbol>(comp, ""sv, syntax.getFirstToken().location(),
+                                                     StatementBlockKind::Sequential,
+                                                     VariableLifetime::Automatic);
+    result->binder.setItems(*result, syntax.items, syntax.sourceRange(), StatementFlags::InRandSeq);
+    result->setSyntax(syntax);
+    return *result;
+}
+
 StatementBlockSymbol& StatementBlockSymbol::fromLabeledStmt(const Scope& scope,
                                                             const StatementSyntax& syntax,
                                                             bitmask<StatementFlags> flags) {
@@ -142,21 +200,32 @@ StatementBlockSymbol& StatementBlockSymbol::fromLabeledStmt(const Scope& scope,
 
 void StatementBlockSymbol::elaborateVariables(function_ref<void(const Symbol&)> insertCB) const {
     auto stmtSyntax = binder.getSyntax();
-    if (!stmtSyntax || stmtSyntax->kind != SyntaxKind::ForeachLoopStatement)
+    if (!stmtSyntax) {
+        if (auto bs = getSyntax(); bs && bs->kind == SyntaxKind::RsRule) {
+            // Create variables to hold results from all non-void productions
+            // invoked by this rule.
+            SmallVectorSized<const Symbol*, 8> vars;
+            RandSeqProductionSymbol::createRuleVariables(bs->as<RsRuleSyntax>(), *this, vars);
+            for (auto var : vars)
+                insertCB(*var);
+        }
         return;
-
-    const Statement* body = &getBody();
-    if (body->kind == StatementKind::Invalid) {
-        // Unwrap invalid statements here so that we still get foreach loop
-        // variables added even if its body had a problem somewhere.
-        body = body->as<InvalidStatement>().child;
-        if (!body)
-            return;
     }
 
-    for (auto& dim : body->as<ForeachLoopStatement>().loopDims) {
-        if (dim.loopVar)
-            insertCB(*dim.loopVar);
+    if (stmtSyntax->kind == SyntaxKind::ForeachLoopStatement) {
+        const Statement* body = &getBody();
+        if (body->kind == StatementKind::Invalid) {
+            // Unwrap invalid statements here so that we still get foreach loop
+            // variables added even if its body had a problem somewhere.
+            body = body->as<InvalidStatement>().child;
+            if (!body)
+                return;
+        }
+
+        for (auto& dim : body->as<ForeachLoopStatement>().loopDims) {
+            if (dim.loopVar)
+                insertCB(*dim.loopVar);
+        }
     }
 }
 
@@ -180,7 +249,7 @@ ProceduralBlockSymbol& ProceduralBlockSymbol::createProceduralBlock(
 
     bitmask<StatementFlags> flags;
     if (kind == ProceduralBlockKind::Final)
-        flags |= StatementFlags::FuncOrFinal;
+        flags |= StatementFlags::Final;
     if (lifetime == VariableLifetime::Automatic)
         flags |= StatementFlags::AutoLifetime;
 
@@ -249,8 +318,8 @@ static void addBlockMembers(GenerateBlockSymbol& block, const SyntaxNode& syntax
 }
 
 static void createCondGenBlock(Compilation& compilation, const SyntaxNode& syntax,
-                               LookupLocation location, const Scope& parent,
-                               uint32_t constructIndex, bool isInstantiated,
+                               const BindContext& context, uint32_t constructIndex,
+                               bool isInstantiated,
                                const SyntaxList<AttributeInstanceSyntax>& attributes,
                                SmallVector<GenerateBlockSymbol*>& results) {
     // [27.5] If a generate block in a conditional generate construct consists of only one item
@@ -260,12 +329,12 @@ static void createCondGenBlock(Compilation& compilation, const SyntaxNode& synta
     // of the directly nested construct are treated as if they belong to the outer construct.
     switch (syntax.kind) {
         case SyntaxKind::IfGenerate:
-            GenerateBlockSymbol::fromSyntax(compilation, syntax.as<IfGenerateSyntax>(), location,
-                                            parent, constructIndex, isInstantiated, results);
+            GenerateBlockSymbol::fromSyntax(compilation, syntax.as<IfGenerateSyntax>(), context,
+                                            constructIndex, isInstantiated, results);
             return;
         case SyntaxKind::CaseGenerate:
-            GenerateBlockSymbol::fromSyntax(compilation, syntax.as<CaseGenerateSyntax>(), location,
-                                            parent, constructIndex, isInstantiated, results);
+            GenerateBlockSymbol::fromSyntax(compilation, syntax.as<CaseGenerateSyntax>(), context,
+                                            constructIndex, isInstantiated, results);
             return;
         default:
             break;
@@ -277,7 +346,7 @@ static void createCondGenBlock(Compilation& compilation, const SyntaxNode& synta
     auto block = compilation.emplace<GenerateBlockSymbol>(compilation, name, loc, constructIndex,
                                                           isInstantiated);
     block->setSyntax(syntax);
-    block->setAttributes(parent, attributes);
+    block->setAttributes(*context.scope, attributes);
     results.append(block);
 
     if (isInstantiated)
@@ -285,30 +354,29 @@ static void createCondGenBlock(Compilation& compilation, const SyntaxNode& synta
 }
 
 void GenerateBlockSymbol::fromSyntax(Compilation& compilation, const IfGenerateSyntax& syntax,
-                                     LookupLocation location, const Scope& parent,
-                                     uint32_t constructIndex, bool isInstantiated,
+                                     const BindContext& context, uint32_t constructIndex,
+                                     bool isInstantiated,
                                      SmallVector<GenerateBlockSymbol*>& results) {
     optional<bool> selector;
     if (isInstantiated) {
-        BindContext bindContext(parent, location, BindFlags::Constant);
+        BindContext bindContext = context.resetFlags(BindFlags::Constant);
         const auto& cond = Expression::bind(*syntax.condition, bindContext);
         ConstantValue cv = bindContext.eval(cond);
         if (cv && bindContext.requireBooleanConvertible(cond))
             selector = cv.isTrue();
     }
 
-    createCondGenBlock(compilation, *syntax.block, location, parent, constructIndex,
+    createCondGenBlock(compilation, *syntax.block, context, constructIndex,
                        selector.has_value() && selector.value(), syntax.attributes, results);
     if (syntax.elseClause) {
-        createCondGenBlock(compilation, *syntax.elseClause->clause, location, parent,
-                           constructIndex, selector.has_value() && !selector.value(),
-                           syntax.attributes, results);
+        createCondGenBlock(compilation, *syntax.elseClause->clause, context, constructIndex,
+                           selector.has_value() && !selector.value(), syntax.attributes, results);
     }
 }
 
 void GenerateBlockSymbol::fromSyntax(Compilation& compilation, const CaseGenerateSyntax& syntax,
-                                     LookupLocation location, const Scope& parent,
-                                     uint32_t constructIndex, bool isInstantiated,
+                                     const BindContext& context, uint32_t constructIndex,
+                                     bool isInstantiated,
                                      SmallVector<GenerateBlockSymbol*>& results) {
 
     SmallVectorSized<const ExpressionSyntax*, 8> expressions;
@@ -331,12 +399,12 @@ void GenerateBlockSymbol::fromSyntax(Compilation& compilation, const CaseGenerat
         }
     }
 
-    BindContext bindContext(parent, location, BindFlags::Constant);
+    BindContext bindContext = context.resetFlags(BindFlags::Constant);
     SmallVectorSized<const Expression*, 8> bound;
     if (!Expression::bindMembershipExpressions(
-            bindContext, TokenKind::CaseKeyword, /* wildcard */ false,
-            /* unwrapUnpacked */ false, /* allowTypeReferences */ true, *syntax.condition,
-            expressions, bound)) {
+            bindContext, TokenKind::CaseKeyword, /* requireIntegral */ false,
+            /* unwrapUnpacked */ false, /* allowTypeReferences */ true, /* allowOpenRange */ true,
+            *syntax.condition, expressions, bound)) {
         return;
     }
 
@@ -383,31 +451,31 @@ void GenerateBlockSymbol::fromSyntax(Compilation& compilation, const CaseGenerat
             // This is the first match for this entire case generate.
             found = true;
             matchRange = currentMatchRange;
-            createCondGenBlock(compilation, *sci.clause, location, parent, constructIndex,
-                               isInstantiated, syntax.attributes, results);
+            createCondGenBlock(compilation, *sci.clause, context, constructIndex, isInstantiated,
+                               syntax.attributes, results);
         }
         else {
             // If we previously found a block, this block also matched, which we should warn about.
             if (currentFound && !warned) {
-                auto& diag = parent.addDiag(diag::CaseGenerateDup, currentMatchRange);
+                auto& diag = context.addDiag(diag::CaseGenerateDup, currentMatchRange);
                 diag << condVal;
                 diag.addNote(diag::NotePreviousMatch, matchRange.start());
                 warned = true;
             }
 
             // This block is not taken, so create it as uninstantiated.
-            createCondGenBlock(compilation, *sci.clause, location, parent, constructIndex, false,
+            createCondGenBlock(compilation, *sci.clause, context, constructIndex, false,
                                syntax.attributes, results);
         }
     }
 
     if (defBlock) {
         // Only instantiated if no other blocks were instantiated.
-        createCondGenBlock(compilation, *defBlock, location, parent, constructIndex,
+        createCondGenBlock(compilation, *defBlock, context, constructIndex,
                            isInstantiated && !found, syntax.attributes, results);
     }
     else if (!found) {
-        auto& diag = parent.addDiag(diag::CaseGenerateNoBlock, condExpr->sourceRange);
+        auto& diag = context.addDiag(diag::CaseGenerateNoBlock, condExpr->sourceRange);
         diag << condVal;
     }
 }
@@ -481,16 +549,17 @@ static uint64_t getGenerateLoopCount(const Scope& parent) {
     return count ? count : 1;
 }
 
-GenerateBlockArraySymbol& GenerateBlockArraySymbol::fromSyntax(
-    Compilation& compilation, const LoopGenerateSyntax& syntax, SymbolIndex scopeIndex,
-    LookupLocation location, const Scope& parent, uint32_t constructIndex) {
-
+GenerateBlockArraySymbol& GenerateBlockArraySymbol::fromSyntax(Compilation& compilation,
+                                                               const LoopGenerateSyntax& syntax,
+                                                               SymbolIndex scopeIndex,
+                                                               const BindContext& context,
+                                                               uint32_t constructIndex) {
     string_view name = getGenerateBlockName(*syntax.block);
     SourceLocation loc = syntax.block->getFirstToken().location();
     auto result =
         compilation.emplace<GenerateBlockArraySymbol>(compilation, name, loc, constructIndex);
     result->setSyntax(syntax);
-    result->setAttributes(parent, syntax.attributes);
+    result->setAttributes(*context.scope, syntax.attributes);
 
     auto genvar = syntax.identifier;
     if (genvar.isMissing())
@@ -499,18 +568,19 @@ GenerateBlockArraySymbol& GenerateBlockArraySymbol::fromSyntax(
     // Walk up the tree a bit to see if we're nested inside another generate loop.
     // If we are, we'll include that parent's array size in our decision about
     // wether we've looped too many times within one generate block.
-    const uint64_t baseCount = getGenerateLoopCount(parent);
+    const uint64_t baseCount = getGenerateLoopCount(*context.scope);
     const uint64_t loopLimit = compilation.getOptions().maxGenerateSteps;
 
     // If the loop initializer has a `genvar` keyword, we can use the name directly
     // Otherwise we need to do a lookup to make sure we have the actual genvar somewhere.
     if (!syntax.genvar) {
-        auto symbol = Lookup::unqualifiedAt(parent, genvar.valueText(), location, genvar.range());
+        auto symbol = Lookup::unqualifiedAt(*context.scope, genvar.valueText(),
+                                            context.getLocation(), genvar.range());
         if (!symbol)
             return *result;
 
         if (symbol->kind != SymbolKind::Genvar) {
-            auto& diag = parent.addDiag(diag::NotAGenvar, genvar.range());
+            auto& diag = context.addDiag(diag::NotAGenvar, genvar.range());
             diag << genvar.valueText();
             diag.addNote(diag::NoteDeclarationHere, symbol->location);
             return *result;
@@ -539,7 +609,7 @@ GenerateBlockArraySymbol& GenerateBlockArraySymbol::fromSyntax(
     };
 
     // Bind the initialization expression.
-    BindContext bindContext(parent, location, BindFlags::Constant);
+    BindContext bindContext = context.resetFlags(BindFlags::Constant);
     auto& initial = Expression::bindRValue(compilation.getIntegerType(), *syntax.initialExpr,
                                            syntax.equals.location(), bindContext);
     ConstantValue initialVal = bindContext.eval(initial);
@@ -554,7 +624,7 @@ GenerateBlockArraySymbol& GenerateBlockArraySymbol::fromSyntax(
     local.setType(compilation.getIntegerType());
     local.isCompilerGenerated = true;
 
-    iterScope.setTemporaryParent(parent, scopeIndex);
+    iterScope.setTemporaryParent(*context.scope, scopeIndex);
     iterScope.addMember(local);
 
     // Bind the stop and iteration expressions so we can reuse them on each iteration.
@@ -584,7 +654,7 @@ GenerateBlockArraySymbol& GenerateBlockArraySymbol::fromSyntax(
     while (true) {
         loopCount += baseCount;
         if (loopCount > loopLimit) {
-            parent.addDiag(diag::MaxGenerateStepsExceeded, syntax.keyword.range());
+            context.addDiag(diag::MaxGenerateStepsExceeded, syntax.keyword.range());
             return *result;
         }
 

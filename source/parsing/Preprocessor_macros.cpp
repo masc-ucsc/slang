@@ -98,9 +98,11 @@ bool Preprocessor::applyMacroOps(span<Token const> tokens, SmallVector<Token>& d
     Token stringify;
     Token syntheticComment;
     bool anyNewMacros = false;
+    bool didConcat = false;
 
     for (size_t i = 0; i < tokens.size(); i++) {
         Token newToken;
+        bool nextDidConcat = false;
 
         // Once we see a `" token, we start collecting tokens into their own
         // buffer for stringification. Otherwise, just add them to the final
@@ -183,17 +185,33 @@ bool Preprocessor::applyMacroOps(span<Token const> tokens, SmallVector<Token>& d
                             dest.pop();
                             ++i;
 
+                            nextDidConcat = true;
                             anyNewMacros |= newToken.kind == TokenKind::Directive &&
                                             newToken.directiveKind() == SyntaxKind::MacroUsage;
                         }
                     }
                 }
                 break;
-            default:
+            default: {
+                // If last iteration we did a token concatenation, check whether this token
+                // is right next to it (not leading trivia). If so, we should try to
+                // continue the concatenation process.
+                if (didConcat && token.trivia().empty() && emptyArgTrivia.empty()) {
+                    newToken = Lexer::concatenateTokens(alloc, dest.back(), token);
+                    if (newToken) {
+                        dest.pop();
+                        nextDidConcat = true;
+                        break;
+                    }
+                }
+
+                // Otherwise take the token as it is.
                 newToken = token;
                 break;
+            }
         }
 
+        didConcat = nextDidConcat;
         if (!newToken)
             continue;
 
@@ -333,30 +351,44 @@ bool Preprocessor::expandMacro(MacroDef macro, MacroExpansion& expansion,
     SourceLocation expansionLoc =
         sourceManager.createExpansionLoc(start, expansionRange, macroName);
 
-    // now add each body token, substituting arguments as necessary
-    for (auto& token : body) {
-        if (token.kind != TokenKind::Identifier && !LF::isKeyword(token.kind) &&
-            (token.kind != TokenKind::Directive ||
-             token.directiveKind() != SyntaxKind::MacroUsage)) {
+    auto append = [&](Token token) {
+        expansion.append(token, expansionLoc, start, expansionRange);
+        return true;
+    };
 
-            expansion.append(token, expansionLoc, start, expansionRange);
-            continue;
+    bool inDefineDirective = false;
+
+    auto handleToken = [&](Token token) {
+        if (inDefineDirective && !isOnSameLine(token))
+            inDefineDirective = false;
+
+        if (token.kind != TokenKind::Identifier && !LF::isKeyword(token.kind) &&
+            token.kind != TokenKind::Directive) {
+            // Non-identifier, can't be argument substituted.
+            return append(token);
         }
 
-        // Other tools allow arguments to replace matching directive names, e.g.:
-        // `define FOO(bar) `bar
-        // `define ONE 1
-        // `FOO(ONE)   // expands to 1
         string_view text = token.valueText();
-        if (token.kind == TokenKind::Directive && text.length() >= 1)
+        if (token.kind == TokenKind::Directive && !text.empty()) {
+            if (token.directiveKind() != SyntaxKind::MacroUsage) {
+                // If this is the start of a `define directive, note that fact because
+                // during argument expansion we will insert line continuations.
+                if (token.directiveKind() == SyntaxKind::DefineDirective)
+                    inDefineDirective = true;
+                return append(token);
+            }
+
+            // Other tools allow arguments to replace matching directive names, e.g.:
+            // `define FOO(bar) `bar
+            // `define ONE 1
+            // `FOO(ONE)   // expands to 1
             text = text.substr(1);
+        }
 
         // check for formal param
         auto it = argumentMap.find(text);
-        if (it == argumentMap.end()) {
-            expansion.append(token, expansionLoc, start, expansionRange);
-            continue;
-        }
+        if (it == argumentMap.end())
+            return append(token);
 
         // Fully expand out arguments before substitution to make sure we can detect whether
         // a usage of a macro in a replacement list is valid or an illegal recursion.
@@ -377,8 +409,7 @@ bool Preprocessor::expandMacro(MacroDef macro, MacroExpansion& expansion,
             // here to ensure that the trivia of the formal parameter is passed on.
             Token empty(alloc, TokenKind::EmptyMacroArgument, token.trivia(), ""sv,
                         token.location());
-            expansion.append(empty, expansionLoc, start, expansionRange);
-            continue;
+            return append(empty);
         }
 
         // We need to ensure that we get correct spacing for the leading token here;
@@ -408,9 +439,75 @@ bool Preprocessor::expandMacro(MacroDef macro, MacroExpansion& expansion,
             }
         }
 
-        expansion.append(first, argLoc, firstLoc, argRange);
-        for (++begin; begin != end; begin++)
-            expansion.append(*begin, argLoc, firstLoc, argRange);
+        if (inDefineDirective) {
+            // Inside a define directive we need to insert line continuations
+            // any time an expanded token will end up on a new line.
+            auto appendBody = [&](Token token) {
+                if (!isOnSameLine(token)) {
+                    Token lc(alloc, TokenKind::LineContinuation, token.trivia(), "\\"sv,
+                             token.location());
+                    expansion.append(lc, argLoc, firstLoc, argRange,
+                                     /* allowLineContinuation */ true);
+
+                    token = token.withTrivia(alloc, {});
+                }
+                expansion.append(token, argLoc, firstLoc, argRange);
+            };
+
+            appendBody(first);
+            for (++begin; begin != end; begin++)
+                appendBody(*begin);
+        }
+        else {
+            expansion.append(first, argLoc, firstLoc, argRange);
+            for (++begin; begin != end; begin++)
+                expansion.append(*begin, argLoc, firstLoc, argRange);
+        }
+
+        return true;
+    };
+
+    // Now add each body token, substituting arguments as necessary.
+    for (auto token : body) {
+        if (token.kind == TokenKind::Identifier && !token.rawText().empty() &&
+            token.rawText()[0] == '\\') {
+            // Escaped identifier, might need to break apart and substitute
+            // individual pieces of it.
+            size_t index = token.rawText().find("``");
+            if (index != std::string_view::npos) {
+                Token first = token.withRawText(alloc, token.rawText().substr(0, index));
+                if (!handleToken(first))
+                    return false;
+
+                SmallVectorSized<Token, 8> splits;
+                Lexer::splitTokens(alloc, diagnostics, sourceManager, token, index,
+                                   getCurrentKeywordVersion(), splits);
+
+                for (auto t : splits) {
+                    if (!handleToken(t))
+                        return false;
+                }
+
+                // Add an empty argument in here so we can make sure a space ends
+                // the escaped identifier once it gets concatenated again.
+                if (!splits.empty()) {
+                    SmallVectorSized<Trivia, 2> triviaBuf;
+                    triviaBuf.emplace(TriviaKind::Whitespace, " "sv);
+
+                    auto loc = splits.back().location() + splits.back().rawText().length();
+                    Token empty(alloc, TokenKind::EmptyMacroArgument, triviaBuf.copy(alloc), ""sv,
+                                loc);
+
+                    if (!handleToken(empty))
+                        return false;
+                }
+
+                continue;
+            }
+        }
+
+        if (!handleToken(token))
+            return false;
     }
 
     return true;
@@ -435,12 +532,14 @@ SourceLocation Preprocessor::MacroExpansion::adjustLoc(Token token, SourceLocati
 }
 
 void Preprocessor::MacroExpansion::append(Token token, SourceLocation& macroLoc,
-                                          SourceLocation& firstLoc, SourceRange expansionRange) {
+                                          SourceLocation& firstLoc, SourceRange expansionRange,
+                                          bool allowLineContinuation) {
     SourceLocation location = adjustLoc(token, macroLoc, firstLoc, expansionRange);
-    append(token, location);
+    append(token, location, allowLineContinuation);
 }
 
-void Preprocessor::MacroExpansion::append(Token token, SourceLocation location) {
+void Preprocessor::MacroExpansion::append(Token token, SourceLocation location,
+                                          bool allowLineContinuation) {
     if (!any) {
         if (!isTopLevel)
             token = token.withTrivia(alloc, usageSite.trivia());
@@ -450,7 +549,7 @@ void Preprocessor::MacroExpansion::append(Token token, SourceLocation location) 
     }
 
     // Line continuations get stripped out when we expand macros and become newline trivia instead.
-    if (token.kind == TokenKind::LineContinuation) {
+    if (token.kind == TokenKind::LineContinuation && !allowLineContinuation) {
         SmallVectorSized<Trivia, 8> newTrivia;
         newTrivia.appendRange(token.trivia());
         newTrivia.append(Trivia(TriviaKind::EndOfLine, token.rawText().substr(1)));

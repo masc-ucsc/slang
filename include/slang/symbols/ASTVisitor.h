@@ -8,6 +8,7 @@
 
 #include "slang/binding/AssertionExpr.h"
 #include "slang/binding/AssignmentExpressions.h"
+#include "slang/binding/CallExpression.h"
 #include "slang/binding/Constraints.h"
 #include "slang/binding/LiteralExpressions.h"
 #include "slang/binding/MiscExpressions.h"
@@ -153,6 +154,7 @@ decltype(auto) Symbol::visit(TVisitor&& visitor, Args&&... args) const {
         SYMBOL(Subroutine);
         SYMBOL(Modport);
         SYMBOL(ModportPort);
+        SYMBOL(ModportClocking);
         SYMBOL(ContinuousAssign);
         SYMBOL(Genvar);
         SYMBOL(ElabSystemTask);
@@ -172,6 +174,9 @@ decltype(auto) Symbol::visit(TVisitor&& visitor, Args&&... args) const {
         SYMBOL(AssertionPort);
         SYMBOL(ClockingBlock);
         SYMBOL(ClockVar);
+        SYMBOL(LocalAssertionVar);
+        SYMBOL(LetDecl);
+        SYMBOL(RandSeqProduction);
         TYPE(PredefinedIntegerType);
         TYPE(ScalarType);
         TYPE(FloatingType);
@@ -239,6 +244,8 @@ decltype(auto) Statement::visit(TVisitor&& visitor, Args&&... args) const {
         CASE(EventTrigger, EventTriggerStatement);
         CASE(ProceduralAssign, ProceduralAssignStatement);
         CASE(ProceduralDeassign, ProceduralDeassignStatement);
+        CASE(RandCase, RandCaseStatement);
+        CASE(RandSequence, RandSequenceStatement);
     }
 #undef CASE
     // clang-format on
@@ -311,8 +318,9 @@ decltype(auto) Expression::visitExpression(TExpression* expr, TVisitor&& visitor
         CASE(NewClass, NewClassExpression);
         CASE(CopyClass, CopyClassExpression);
         CASE(MinTypMax, MinTypMaxExpression);
-        CASE(ClockingArgument, ClockingArgumentExpression);
+        CASE(ClockingEvent, ClockingEventExpression);
         CASE(AssertionInstance, AssertionInstanceExpression);
+        CASE(TaggedUnion, TaggedUnionExpression);
     }
 #undef CASE
     // clang-format on
@@ -364,9 +372,10 @@ decltype(auto) AssertionExpr::visit(TVisitor& visitor, Args&&... args) const {
     // clang-format off
 #define CASE(k, n) case AssertionExprKind::k: return visitor.visit(*static_cast<const n*>(this), std::forward<Args>(args)...)
     switch (kind) {
-        case AssertionExprKind::Invalid: return visitor.visit(*this, std::forward<Args>(args)...);
+        case AssertionExprKind::Invalid: return visitor.visitInvalid(*this, std::forward<Args>(args)...);
         CASE(Simple, SimpleAssertionExpr);
         CASE(SequenceConcat, SequenceConcatExpr);
+        CASE(SequenceWithMatch, SequenceWithMatchExpr);
         CASE(Unary, UnaryAssertionExpr);
         CASE(Binary, BinaryAssertionExpr);
         CASE(FirstMatch, FirstMatchAssertionExpr);
@@ -375,6 +384,7 @@ decltype(auto) AssertionExpr::visit(TVisitor& visitor, Args&&... args) const {
         CASE(Abort, AbortAssertionExpr);
         CASE(Conditional, ConditionalAssertionExpr);
         CASE(Case, CaseAssertionExpr);
+        CASE(DisableIff, DisableIffAssertionExpr);
     }
 #undef CASE
     // clang-format on

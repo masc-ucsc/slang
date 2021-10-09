@@ -68,10 +68,13 @@ AssertionKind SemanticFacts::getAssertKind(SyntaxKind kind) {
     switch (kind) {
         case SyntaxKind::ImmediateAssertStatement: return AssertionKind::Assert;
         case SyntaxKind::ImmediateAssumeStatement: return AssertionKind::Assume;
-        case SyntaxKind::ImmediateCoverStatement: return AssertionKind::Cover;
+        case SyntaxKind::ImmediateCoverStatement: return AssertionKind::CoverProperty;
         case SyntaxKind::AssertPropertyStatement: return AssertionKind::Assert;
         case SyntaxKind::AssumePropertyStatement: return AssertionKind::Assume;
-        case SyntaxKind::CoverPropertyStatement: return AssertionKind::Cover;
+        case SyntaxKind::CoverPropertyStatement: return AssertionKind::CoverProperty;
+        case SyntaxKind::CoverSequenceStatement: return AssertionKind::CoverSequence;
+        case SyntaxKind::ExpectPropertyStatement: return AssertionKind::Expect;
+        case SyntaxKind::RestrictPropertyStatement: return AssertionKind::Restrict;
         default: THROW_UNREACHABLE;
     }
 }
@@ -189,6 +192,7 @@ bool SemanticFacts::isAllowedInModport(SymbolKind kind) {
         case SymbolKind::Net:
         case SymbolKind::Variable:
         case SymbolKind::Subroutine:
+        case SymbolKind::ClockingBlock:
             return true;
         default:
             return false;

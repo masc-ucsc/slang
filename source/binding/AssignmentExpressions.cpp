@@ -7,6 +7,7 @@
 #include "slang/binding/AssignmentExpressions.h"
 
 #include "slang/binding/Bitstream.h"
+#include "slang/binding/CallExpression.h"
 #include "slang/binding/LiteralExpressions.h"
 #include "slang/binding/MiscExpressions.h"
 #include "slang/binding/OperatorExpressions.h"
@@ -213,8 +214,8 @@ Expression* Expression::tryConnectPortArray(const BindContext& context, const Ty
 
 bool Expression::isImplicitlyAssignableTo(const Type& targetType) const {
     return targetType.isAssignmentCompatible(*type) ||
-           (targetType.isString() && isImplicitString()) ||
-           (targetType.isEnum() && isSameEnum(*this, *type));
+           ((targetType.isString() || targetType.isByteArray()) && isImplicitString()) ||
+           (targetType.isEnum() && isSameEnum(*this, targetType));
 }
 
 Expression& Expression::convertAssignment(const BindContext& context, const Type& type,
@@ -268,9 +269,7 @@ Expression& Expression::convertAssignment(const BindContext& context, const Type
     if (!type.isAssignmentCompatible(*rt)) {
         // String literals have a type of integer, but are allowed to implicitly convert to the
         // string type. See comments on isSameEnum for why that's here as well.
-        if (((type.isString() || type.isByteArray()) && expr.isImplicitString()) ||
-            (type.isEnum() && isSameEnum(expr, type))) {
-
+        if (expr.isImplicitlyAssignableTo(type)) {
             result = &ConversionExpression::makeImplicit(context, type, ConversionKind::Implicit,
                                                          *result, location);
             selfDetermined(context, result);
@@ -336,6 +335,13 @@ Expression& Expression::convertAssignment(const BindContext& context, const Type
 Expression& AssignmentExpression::fromSyntax(Compilation& compilation,
                                              const BinaryExpressionSyntax& syntax,
                                              const BindContext& context) {
+    bool isNonBlocking = syntax.kind == SyntaxKind::NonblockingAssignmentExpression;
+
+    if (isNonBlocking && context.flags.has(BindFlags::Final)) {
+        context.addDiag(diag::NonblockingInFinal, syntax.sourceRange());
+        return badExpr(compilation, nullptr);
+    }
+
     if (!context.flags.has(BindFlags::AssignmentAllowed)) {
         if (!context.flags.has(BindFlags::NonProcedural) &&
             !context.flags.has(BindFlags::AssignmentDisallowed)) {
@@ -358,7 +364,6 @@ Expression& AssignmentExpression::fromSyntax(Compilation& compilation,
     }
 
     const ExpressionSyntax* rightExpr = syntax.right;
-    bool isNonBlocking = syntax.kind == SyntaxKind::NonblockingAssignmentExpression;
 
     // If we're in a top-level statement, check for an intra-assignment timing control.
     // Otherwise, we'll let this fall through to the default handler which will issue an error.
@@ -367,6 +372,7 @@ Expression& AssignmentExpression::fromSyntax(Compilation& compilation,
         rightExpr->kind == SyntaxKind::TimingControlExpression) {
 
         BindContext timingCtx = context;
+        timingCtx.flags |= BindFlags::LValue;
         if (isNonBlocking)
             timingCtx.flags |= BindFlags::NonBlockingTimingControl;
 
@@ -391,8 +397,7 @@ Expression& AssignmentExpression::fromSyntax(Compilation& compilation,
             if (rhs->bad())
                 return badExpr(compilation, rhs);
 
-            Expression* lhs =
-                &create(compilation, *syntax.left, context, BindFlags::None, rhs->type);
+            auto lhs = &create(compilation, *syntax.left, context, BindFlags::LValue, rhs->type);
             selfDetermined(context, lhs);
 
             return fromComponents(compilation, op, isNonBlocking, *lhs, *rhs,
@@ -401,7 +406,7 @@ Expression& AssignmentExpression::fromSyntax(Compilation& compilation,
         }
     }
 
-    Expression& lhs = selfDetermined(compilation, *syntax.left, context, extraFlags);
+    auto& lhs = selfDetermined(compilation, *syntax.left, context, extraFlags | BindFlags::LValue);
 
     Expression* rhs = nullptr;
     if (lhs.type->isVirtualInterface())
@@ -425,25 +430,6 @@ Expression& AssignmentExpression::fromSyntax(Compilation& compilation,
     return fromComponents(compilation, op, isNonBlocking, lhs, *rhs,
                           syntax.operatorToken.location(), timingControl, syntax.sourceRange(),
                           context);
-}
-
-static const Symbol* getLValueSym(const Expression& expr) {
-    auto valExpr = &expr;
-    while (true) {
-        if (valExpr->kind == ExpressionKind::MemberAccess)
-            valExpr = &valExpr->as<MemberAccessExpression>().value();
-        else if (valExpr->kind == ExpressionKind::ElementSelect)
-            valExpr = &valExpr->as<ElementSelectExpression>().value();
-        else if (valExpr->kind == ExpressionKind::RangeSelect)
-            valExpr = &valExpr->as<RangeSelectExpression>().value();
-        else
-            break;
-    }
-
-    if (ValueExpressionBase::isKind(valExpr->kind))
-        return &valExpr->as<ValueExpressionBase>().symbol;
-
-    return nullptr;
 }
 
 Expression& AssignmentExpression::fromComponents(
@@ -484,7 +470,7 @@ Expression& AssignmentExpression::fromComponents(
     if (timingControl) {
         // Cycle delays are only allowed on clock vars, and clock vars
         // cannot use any timing control other than cycle delays.
-        if (auto sym = getLValueSym(lhs); sym && sym->kind == SymbolKind::ClockVar) {
+        if (auto sym = lhs.getSymbolReference(); sym && sym->kind == SymbolKind::ClockVar) {
             if (timingControl->kind != TimingControlKind::CycleDelay) {
                 ASSERT(timingControl->syntax);
                 context.addDiag(diag::ClockVarBadTiming, timingControl->syntax->sourceRange());
@@ -695,9 +681,7 @@ static void checkImplicitConversions(const BindContext& context, const Type& tar
 Expression& ConversionExpression::makeImplicit(const BindContext& context, const Type& targetType,
                                                ConversionKind conversionKind, Expression& expr,
                                                SourceLocation loc) {
-    ASSERT(targetType.isAssignmentCompatible(*expr.type) ||
-           ((targetType.isString() || targetType.isByteArray()) && expr.isImplicitString()) ||
-           (targetType.isEnum() && isSameEnum(expr, targetType)));
+    ASSERT(expr.isImplicitlyAssignableTo(targetType));
 
     Expression* op = &expr;
     selfDetermined(context, op);

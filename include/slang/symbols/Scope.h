@@ -113,6 +113,7 @@ public:
     /// An iterator for members in the scope.
     class iterator : public iterator_facade<iterator, std::forward_iterator_tag, const Symbol> {
     public:
+        iterator() : current(nullptr) {}
         iterator(const Symbol* firstSymbol) : current(firstSymbol) {}
         iterator(const iterator& other) : current(other.current) {}
 
@@ -143,6 +144,7 @@ public:
         : public iterator_facade<specific_symbol_iterator<SpecificType>, std::forward_iterator_tag,
                                  const SpecificType> {
     public:
+        specific_symbol_iterator() : current(nullptr) {}
         specific_symbol_iterator(const Symbol* firstSymbol) : current(firstSymbol) { skipToNext(); }
         specific_symbol_iterator(const specific_symbol_iterator& other) : current(other.current) {}
 
@@ -304,6 +306,10 @@ private:
 
     // Reports an error for a name conflict between two symbols.
     void reportNameConflict(const Symbol& member, const Symbol& existing) const;
+
+    // Checks for a conflict when multiple imports (or exports) target symbols
+    // with the same name.
+    void checkImportConflict(const Symbol& member, const Symbol& existing) const;
 
     // Add a wildcard import to this scope.
     void addWildcardImport(const PackageImportItemSyntax& item,

@@ -14,6 +14,7 @@
 #include "slang/diagnostics/StatementsDiags.h"
 #include "slang/diagnostics/TypesDiags.h"
 #include "slang/symbols/AttributeSymbol.h"
+#include "slang/symbols/InstanceSymbols.h"
 #include "slang/symbols/SubroutineSymbols.h"
 #include "slang/symbols/VariableSymbols.h"
 #include "slang/syntax/AllSyntax.h"
@@ -23,6 +24,10 @@ namespace slang {
 
 Compilation& BindContext::getCompilation() const {
     return scope->getCompilation();
+}
+
+bool BindContext::isPortConnection() const {
+    return instance && !instance->arrayPath.empty();
 }
 
 void BindContext::setAttributes(const Statement& stmt,
@@ -49,11 +54,17 @@ void BindContext::setAttributes(const Expression& expr,
 }
 
 Diagnostic& BindContext::addDiag(DiagCode code, SourceLocation location) const {
-    return scope->addDiag(code, location);
+    auto& diag = scope->addDiag(code, location);
+    if (assertionInstance)
+        addAssertionBacktrace(diag);
+    return diag;
 }
 
 Diagnostic& BindContext::addDiag(DiagCode code, SourceRange sourceRange) const {
-    return scope->addDiag(code, sourceRange);
+    auto& diag = scope->addDiag(code, sourceRange);
+    if (assertionInstance)
+        addAssertionBacktrace(diag);
+    return diag;
 }
 
 bool BindContext::requireIntegral(const ConstantValue& cv, SourceRange range) const {
@@ -192,8 +203,9 @@ optional<bitwidth_t> BindContext::requireValidBitWidth(const SVInt& value,
     return result;
 }
 
-optional<int32_t> BindContext::evalInteger(const ExpressionSyntax& syntax) const {
-    return evalInteger(Expression::bind(syntax, resetFlags(BindFlags::Constant)));
+optional<int32_t> BindContext::evalInteger(const ExpressionSyntax& syntax,
+                                           bitmask<BindFlags> extraFlags) const {
+    return evalInteger(Expression::bind(syntax, resetFlags(BindFlags::Constant | extraFlags)));
 }
 
 optional<int32_t> BindContext::evalInteger(const Expression& expr) const {
@@ -295,6 +307,11 @@ optional<ConstantRange> BindContext::evalUnpackedDimension(
 
 const ExpressionSyntax* BindContext::requireSimpleExpr(
     const PropertyExprSyntax& initialExpr) const {
+    return requireSimpleExpr(initialExpr, diag::InvalidArgumentExpr);
+}
+
+const ExpressionSyntax* BindContext::requireSimpleExpr(const PropertyExprSyntax& initialExpr,
+                                                       DiagCode code) const {
     const SyntaxNode* expr = &initialExpr;
     if (expr->kind == SyntaxKind::SimplePropertyExpr) {
         expr = expr->as<SimplePropertyExprSyntax>().expr;
@@ -305,8 +322,23 @@ const ExpressionSyntax* BindContext::requireSimpleExpr(
         }
     }
 
-    addDiag(diag::InvalidArgumentExpr, initialExpr.sourceRange());
+    addDiag(code, initialExpr.sourceRange());
     return nullptr;
+}
+
+RandMode BindContext::getRandMode(const Symbol& symbol) const {
+    RandMode mode = symbol.getRandMode();
+    if (mode != RandMode::None)
+        return mode;
+
+    if (randomizeDetails) {
+        if (auto it = randomizeDetails->scopeRandVars.find(&symbol);
+            it != randomizeDetails->scopeRandVars.end()) {
+            return RandMode::Rand;
+        }
+    }
+
+    return RandMode::None;
 }
 
 static bool checkIndexType(const Type& type) {
@@ -421,6 +453,38 @@ BindContext BindContext::resetFlags(bitmask<BindFlags> addedFlags) const {
     result.flags &= ~NonSticky;
     result.flags |= addedFlags;
     return result;
+}
+
+void BindContext::addAssertionBacktrace(Diagnostic& diag) const {
+    if (!assertionInstance)
+        return;
+
+    auto& inst = *assertionInstance;
+    if (inst.argExpansionLoc) {
+        diag.addNote(diag::NoteExpandedHere, inst.argExpansionLoc);
+    }
+    else {
+        ASSERT(inst.symbol);
+
+        auto& note = diag.addNote(diag::NoteWhileExpanding, inst.instanceLoc);
+        switch (inst.symbol->kind) {
+            case SymbolKind::Sequence:
+                note << "sequence"sv;
+                break;
+            case SymbolKind::Property:
+                note << "property"sv;
+                break;
+            case SymbolKind::LetDecl:
+                note << "let declaration"sv;
+                break;
+            default:
+                THROW_UNREACHABLE;
+        }
+        note << inst.symbol->name;
+    }
+
+    ASSERT(inst.prevContext);
+    inst.prevContext->addAssertionBacktrace(diag);
 }
 
 } // namespace slang

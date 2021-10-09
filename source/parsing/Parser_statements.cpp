@@ -120,6 +120,28 @@ StatementSyntax& Parser::parseStatement(bool allowEmpty, bool allowSuperNew) {
             return parseEventTriggerStatement(label, attributes);
         case TokenKind::VoidKeyword:
             return parseVoidCallStatement(label, attributes);
+        case TokenKind::Identifier: {
+            // This could be a checker instantiation.
+            uint32_t index = 1;
+            if (peek(index).kind == TokenKind::DoubleColon &&
+                peek(index + 1).kind == TokenKind::Identifier) {
+                index = 3;
+            }
+
+            if (peek(index).kind == TokenKind::Identifier &&
+                peek(index + 1).kind == TokenKind::OpenParenthesis) {
+                return parseCheckerStatement(label, attributes);
+            }
+
+            break;
+        }
+        case TokenKind::UnitSystemName:
+            if (peek(1).kind == TokenKind::DoubleColon && peek(2).kind == TokenKind::Identifier &&
+                peek(3).kind == TokenKind::Identifier &&
+                peek(4).kind == TokenKind::OpenParenthesis) {
+                return parseCheckerStatement(label, attributes);
+            }
+            break;
         default:
             break;
     }
@@ -364,6 +386,11 @@ ForeachLoopListSyntax& Parser::parseForeachLoopVariables() {
     auto openParen = expect(TokenKind::OpenParenthesis);
     auto& arrayName = parseName(NameOptions::ForeachName);
 
+    if (arrayName.kind == SyntaxKind::IdentifierSelectName) {
+        SourceRange range = arrayName.sourceRange();
+        addDiag(diag::NonstandardForeach, range.start()) << range;
+    }
+
     span<TokenOrSyntax> list;
     Token openBracket;
     Token closeBracket;
@@ -585,7 +612,7 @@ span<SyntaxNode*> Parser::parseBlockItems(TokenKind endKind, Token& end, bool in
     bool sawStatement = false;
     bool erroredAboutDecls = false;
 
-    while (!isEndKeyword(kind) && kind != TokenKind::EndOfFile) {
+    while (!isEndKeyword(kind) && kind != endKind && kind != TokenKind::EndOfFile) {
         SourceLocation loc = peek().location();
         SyntaxNode* newNode = nullptr;
         bool isStmt = false;
@@ -867,6 +894,19 @@ RsRuleSyntax& Parser::parseRsRule() {
             break;
 
         prods.append(prod);
+        if (randJoin && prod->kind != SyntaxKind::RsProdItem) {
+            addDiag(diag::RandJoinProdItem, prod->getFirstToken().location())
+                << prod->sourceRange();
+        }
+    }
+
+    if (randJoin && prods.size() < 2) {
+        SourceRange range = randJoin->sourceRange();
+        if (!prods.empty()) {
+            range = SourceRange{ range.start(), prods.back()->getLastToken().range().end() };
+        }
+
+        addDiag(diag::RandJoinNotEnough, range.start()) << range;
     }
 
     RsWeightClauseSyntax* weightClause = nullptr;
@@ -915,17 +955,20 @@ StatementSyntax& Parser::parseRandSequenceStatement(NamedLabelSyntax* label, Att
     auto closeParen = expect(TokenKind::CloseParenthesis);
 
     SmallVectorSized<ProductionSyntax*, 16> productions;
-    while (true) {
-        auto kind = peek().kind;
-        if (kind == TokenKind::EndOfFile || kind == TokenKind::EndSequenceKeyword)
-            break;
-
+    while (isPossibleDataType(peek().kind))
         productions.append(&parseProduction());
-    }
+
+    if (productions.empty())
+        addDiag(diag::ExpectedRsRule, peek().location());
 
     auto endsequence = expect(TokenKind::EndSequenceKeyword);
     return factory.randSequenceStatement(label, attributes, keyword, openParen, firstProd,
                                          closeParen, productions.copy(alloc), endsequence);
+}
+
+StatementSyntax& Parser::parseCheckerStatement(NamedLabelSyntax* label, AttrList attributes) {
+    auto& instance = parseCheckerInstantiation({});
+    return factory.checkerInstanceStatement(label, attributes, instance);
 }
 
 } // namespace slang

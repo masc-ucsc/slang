@@ -1465,3 +1465,43 @@ endmodule
     compilation.addSyntaxTree(tree);
     NO_COMPILATION_ERRORS;
 }
+
+TEST_CASE("Package with net assign regress GH #415") {
+    auto tree = SyntaxTree::fromText(R"(
+package p2;
+wire varwidth = FIVE;
+endpackage
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 1);
+    CHECK(diags[0].code == diag::UndeclaredIdentifier);
+}
+
+TEST_CASE("Assertion expressions in hierarchical instance") {
+    auto tree = SyntaxTree::fromText(R"(
+interface I; endinterface
+
+module m(I i, input int j);
+endmodule
+
+module n;
+    m m1(a |-> b, a [*3]);
+    m m2(a throughout b, 4);
+    m m3(a [*3], 4);
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 4);
+    CHECK(diags[0].code == diag::InvalidArgumentExpr);
+    CHECK(diags[1].code == diag::InvalidArgumentExpr);
+    CHECK(diags[2].code == diag::InvalidArgumentExpr);
+    CHECK(diags[3].code == diag::InvalidArgumentExpr);
+}

@@ -8,6 +8,7 @@
 #include "slang/compilation/Compilation.h"
 #include "slang/diagnostics/ConstEvalDiags.h"
 #include "slang/diagnostics/SysFuncsDiags.h"
+#include "slang/symbols/ParameterSymbols.h"
 #include "slang/types/TypePrinter.h"
 
 namespace slang::Builtins {
@@ -28,13 +29,14 @@ public:
         if (!checkArgCount(context, false, args, range, 1, 1))
             return comp.getErrorType();
 
-        if (!args[0]->type->isBitstreamType())
+        auto& type = *args[0]->type;
+        if (!type.isBitstreamType() && !type.isFloating() && !type.isUnpackedUnion())
             return badArg(context, *args[0]);
 
-        if (args[0]->kind == ExpressionKind::DataType && !args[0]->type->isFixedSize()) {
+        if (args[0]->kind == ExpressionKind::DataType && !type.isFixedSize()) {
             auto& diag = context.addDiag(diag::QueryOnDynamicType, args[0]->sourceRange) << name;
-            if (args[0]->type->location)
-                diag.addNote(diag::NoteDeclarationHere, args[0]->type->location);
+            if (type.location)
+                diag.addNote(diag::NoteDeclarationHere, type.location);
             return comp.getErrorType();
         }
         return comp.getIntegerType();
@@ -43,20 +45,19 @@ public:
     ConstantValue eval(EvalContext& context, const Args& args,
                        const CallExpression::SystemCallInfo&) const final {
         size_t width;
-        if (args[0]->type->isFixedSize())
+        if (args[0]->type->isFixedSize()) {
             width = args[0]->type->bitstreamWidth();
+        }
+        else if (args[0]->kind == ExpressionKind::DataType) {
+            auto& diag = context.addDiag(diag::ConstEvalBitsNotFixedSize, args[0]->sourceRange);
+            diag << *args[0]->type;
+            return nullptr;
+        }
         else {
-            if (args[0]->kind == ExpressionKind::DataType) {
-                auto& diag = context.addDiag(diag::ConstEvalBitsNotFixedSize, args[0]->sourceRange);
-                diag << *args[0]->type;
+            ConstantValue cv = args[0]->eval(context);
+            if (!cv)
                 return nullptr;
-            }
-            else {
-                ConstantValue cv = args[0]->eval(context);
-                if (!cv)
-                    return nullptr;
-                width = cv.bitstreamWidth();
-            }
+            width = cv.bitstreamWidth();
         }
 
         // TODO: width > INT_MAX
@@ -91,6 +92,43 @@ public:
         printer.append(*args[0]->type);
 
         return printer.toString();
+    }
+
+    bool verifyConstant(EvalContext&, const Args&, SourceRange) const final { return true; }
+};
+
+class IsUnboundedFunction : public SystemSubroutine {
+public:
+    IsUnboundedFunction() : SystemSubroutine("$isunbounded", SubroutineKind::Function) {}
+
+    const Expression& bindArgument(size_t, const BindContext& context,
+                                   const ExpressionSyntax& syntax, const Args&) const final {
+        return Expression::bind(syntax, context,
+                                BindFlags::Constant | BindFlags::AllowUnboundedLiteral);
+    }
+
+    const Type& checkArguments(const BindContext& context, const Args& args, SourceRange range,
+                               const Expression*) const final {
+        auto& comp = context.getCompilation();
+        if (!checkArgCount(context, false, args, range, 1, 1))
+            return comp.getErrorType();
+
+        return comp.getBitType();
+    }
+
+    ConstantValue eval(EvalContext&, const Args& args,
+                       const CallExpression::SystemCallInfo&) const final {
+        if (args[0]->type->isUnbounded())
+            return SVInt(1, 1, false);
+
+        if (args[0]->kind == ExpressionKind::NamedValue) {
+            auto sym = args[0]->getSymbolReference();
+            if (sym && sym->kind == SymbolKind::Parameter &&
+                sym->as<ParameterSymbol>().getValue().isUnbounded())
+                return SVInt(1, 1, false);
+        }
+
+        return SVInt(1, 0, false);
     }
 
     bool verifyConstant(EvalContext&, const Args&, SourceRange) const final { return true; }
@@ -483,6 +521,7 @@ void registerQueryFuncs(Compilation& c) {
 #define REGISTER(name) c.addSystemSubroutine(std::make_unique<name##Function>())
     REGISTER(Bits);
     REGISTER(Typename);
+    REGISTER(IsUnbounded);
     REGISTER(Low);
     REGISTER(High);
     REGISTER(Left);

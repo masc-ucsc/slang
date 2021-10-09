@@ -958,11 +958,15 @@ endmodule
 
 TEST_CASE("Unpacked struct/union errors") {
     auto tree = SyntaxTree::fromText(R"(
+interface I; endinterface
+
 module m;
     struct signed { int i; } s1;
     struct { int i; } [3:0] s2;
     union unsigned { int j; } u1;
     union { int i; } [3:0] u2;
+    union { virtual interface I i; int j[]; } u3;
+    struct tagged { int i; } s3;
 endmodule
 )");
 
@@ -970,11 +974,14 @@ endmodule
     compilation.addSyntaxTree(tree);
 
     auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 4);
+    REQUIRE(diags.size() == 7);
     CHECK(diags[0].code == diag::UnpackedSigned);
     CHECK(diags[1].code == diag::PackedDimsOnUnpacked);
     CHECK(diags[2].code == diag::UnpackedSigned);
     CHECK(diags[3].code == diag::PackedDimsOnUnpacked);
+    CHECK(diags[4].code == diag::VirtualInterfaceUnionMember);
+    CHECK(diags[5].code == diag::InvalidUnionMember);
+    CHECK(diags[6].code == diag::TaggedStruct);
 }
 
 TEST_CASE("Array elements max size") {
@@ -1090,6 +1097,203 @@ endmodule
     options.disableInstanceCaching = true;
 
     Compilation compilation(options);
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Enum base error regress GH #414") {
+    auto tree = SyntaxTree::fromText(R"(
+enum DataWidth { CORE_STATUS, TEST_RESULT, WRITE_GPR } signature_type_t;
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 1);
+    CHECK(diags[0].code == diag::UndeclaredIdentifier);
+}
+
+TEST_CASE("Tagged unions") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    typedef union tagged {
+        struct {
+            bit [4:0] reg1, reg2, regd;
+        } Add;
+        union tagged {
+            bit [9:0] JmpU;
+            struct {
+                bit [1:0] cc; 
+                bit [9:0] addr;
+            } JmpC;
+        } Jmp;
+        chandle baz;
+        int bar[];
+    } Instr;
+
+    typedef union tagged {
+        void Invalid;
+        int Valid;
+    } VInt;
+
+    typedef union tagged packed {
+        struct packed {
+            bit [4:0] reg1, reg2, regd;
+        } Add;
+        union tagged packed {
+            bit [9:0] JmpU;
+            struct packed {
+                bit [1:0] cc; 
+                bit [9:0] addr;
+            } JmpC;
+        } Jmp;
+    } InstrPacked;
+
+    typedef union tagged packed {
+        void Invalid;
+        int Valid;
+    } VIntPacked;
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Enum used in uninstantiated module -- regress") {
+    auto tree = SyntaxTree::fromText(R"(
+module m #(parameter foo);
+    typedef enum logic[foo-1:0] { A, B } et;
+    int i = A;
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Virtual interfaces with clocking blocks") {
+    auto tree = SyntaxTree::fromText(R"(
+interface SyncBus( input logic clk );
+    wire a, b, c;
+    clocking sb @(posedge clk); 
+        input a;
+        output b;
+        inout c;
+    endclocking 
+endinterface
+
+typedef virtual SyncBus VI;
+
+task do_it( VI v );
+    if( v.sb.a == 1 )
+        v.sb.b <= 0;
+    else 
+        v.sb.c <= ##1 1;
+endtask
+
+module top;
+    logic clk;
+    SyncBus b1( clk );
+    SyncBus b2( clk );
+
+    initial begin 
+        static VI v[2] = '{ b1, b2 };
+        repeat( 20 )
+            do_it( v[ $urandom_range( 0, 1 ) ] );
+    end
+endmodule
+
+interface A_Bus( input logic clk );
+    wire req, gnt;
+    wire [7:0] addr, data;
+
+    clocking sb @(posedge clk); 
+        input gnt;
+        output req, addr;
+        inout data;
+        property p1; req ##[1:3] gnt; endproperty 
+    endclocking
+
+    modport DUT ( input clk, req, addr,
+                  output gnt,
+                  inout data );
+    
+    modport STB ( clocking sb );
+
+    modport TB ( input gnt,
+                 output req, addr, 
+                 inout data );
+endinterface
+
+module dev1(A_Bus.DUT b);
+endmodule
+
+module dev2(A_Bus.DUT b);
+endmodule
+
+module top2;
+    logic clk;
+    A_Bus b1( clk );
+    A_Bus b2( clk );
+
+    dev1 d1( b1 );
+    dev2 d2( b2 );
+
+    T tb( b1, b2 );
+endmodule
+
+program T (A_Bus.STB b1, A_Bus.STB b2 );
+    typedef virtual A_Bus.STB SYNCTB;
+
+    task request( SYNCTB s );
+        s.sb.req <= 1;
+    endtask
+
+    task wait_grant( SYNCTB s );
+        wait( s.sb.gnt == 1 );
+    endtask
+
+    task drive(SYNCTB s, logic [7:0] adr, data );
+        if( s.sb.gnt == 0 ) begin 
+            request(s);
+            wait_grant(s);
+        end
+    
+        s.sb.addr <= adr;
+        s.sb.data <= data;
+
+        repeat(2) @s.sb;
+        s.sb.req <= 0;
+    endtask
+
+    assert property (b1.sb.p1);
+    initial begin 
+        drive( b1, 8'($random), 8'($random) );
+        drive( b2, 8'($random), 8'($random) );
+    end 
+endprogram
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Typedef + type param colon access regress GH #471") {
+    auto tree = SyntaxTree::fromText(R"(
+class C #(type T);
+    typedef T obj_type;
+    function obj_type create();
+        return obj_type::type_id::create();
+    endfunction
+endclass
+)");
+
+    Compilation compilation;
     compilation.addSyntaxTree(tree);
     NO_COMPILATION_ERRORS;
 }

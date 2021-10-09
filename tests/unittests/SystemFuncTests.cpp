@@ -808,7 +808,13 @@ module m;
         a <= $past(b, 5, a | b);
         a <= $past(b, 0);
         a <= $past_gclk(b);
+        a <= $rose(s.matched);
     end
+
+    sequence s;
+        int i;
+        $past(i);
+    endsequence
 endmodule
 
 module n;
@@ -818,7 +824,10 @@ module n;
     reg a, b;
     always @(posedge clk) begin
         a <= $changed_gclk(b);
+        a <= $changing_gclk(b);
     end
+
+    assert property (@clk $future_gclk(a || $rising_gclk(b)));
 endmodule
 )");
 
@@ -826,9 +835,13 @@ endmodule
     compilation.addSyntaxTree(tree);
 
     auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 2);
+    REQUIRE(diags.size() == 6);
     CHECK(diags[0].code == diag::PastNumTicksInvalid);
     CHECK(diags[1].code == diag::NoGlobalClocking);
+    CHECK(diags[2].code == diag::SampledValueMatched);
+    CHECK(diags[3].code == diag::SampledValueLocalVar);
+    CHECK(diags[4].code == diag::GlobalSampledValueAssertionExpr);
+    CHECK(diags[5].code == diag::GlobalSampledValueNested);
 }
 
 TEST_CASE("Global clock sys func") {
@@ -862,4 +875,146 @@ endmodule
     REQUIRE(diags.size() == 2);
     CHECK(diags[0].code == diag::GlobalClockEventExpr);
     CHECK(diags[1].code == diag::NoGlobalClocking);
+}
+
+TEST_CASE("System call output args in disallowed context") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    int i;
+    assign j = $ferror(i, i);
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 1);
+    CHECK(diags[0].code == diag::NonProceduralFuncArg);
+}
+
+TEST_CASE("Coverage system functions") {
+    auto tree = SyntaxTree::fromText(R"(
+`undef SV_COV_START
+
+module A(input logic x, input logic y);
+endmodule
+
+interface Z(input logic x);
+endinterface
+
+module top;
+    string modName = "A";
+    string hierString = "top.a";
+    string bad;
+    logic x, y;
+
+    A a(.*);
+    A b(.*);
+    Z z(.*);
+
+    initial begin
+        int unsigned result, max;
+        real r;
+        result = $coverage_control(`SV_COV_RESET, `SV_COV_TOGGLE, `SV_COV_MODULE, "A", "B"); // too many args
+        result = $coverage_control(`SV_COV_RESET, `SV_COV_TOGGLE, `SV_COV_MODULE, 4);        // bad type
+        result = $coverage_control(`SV_COV_RESET, `SV_COV_TOGGLE, `SV_COV_MODULE, modName);
+        result = $coverage_control(`SV_COV_RESET, `SV_COV_TOGGLE, `SV_COV_MODULE, hierString);
+        result = $coverage_control(`SV_COV_RESET, `SV_COV_TOGGLE, `SV_COV_MODULE, "A");
+        result = $coverage_control(`SV_COV_RESET, `SV_COV_TOGGLE, `SV_COV_MODULE, "B");
+        result = $coverage_control(`SV_COV_RESET, `SV_COV_TOGGLE, `SV_COV_MODULE, "top.a");
+        result = $coverage_control(`SV_COV_RESET, `SV_COV_TOGGLE, `SV_COV_MODULE, "top.b");
+        result = $coverage_control(`SV_COV_RESET, `SV_COV_TOGGLE, `SV_COV_MODULE, "top.c");
+        result = $coverage_control(`SV_COV_RESET, `SV_COV_TOGGLE, `SV_COV_MODULE, top.a);
+        result = $coverage_control(`SV_COV_RESET, `SV_COV_TOGGLE, `SV_COV_MODULE, top.b);
+        result = $coverage_control(`SV_COV_RESET, `SV_COV_TOGGLE, `SV_COV_MODULE, top.c);   // bad hierarchy
+        result = $coverage_control(`SV_COV_RESET, `SV_COV_TOGGLE, `SV_COV_MODULE, d);       // undeclared
+        result = $coverage_control(`SV_COV_RESET, `SV_COV_TOGGLE, `SV_COV_MODULE, z);       // not a module instance
+        bad = $coverage_get_max(23, 10, "top"); // bad return type
+        result = $coverage_get_max(23, 10, a);
+        result = $coverage_get(23, 10, b);
+        result = $coverage_merge(23, "merged_cov");
+        result = $coverage_save(23, "merged_cov");
+        r = $get_coverage();
+        $set_coverage_db_name("coverage.db");
+        $load_coverage_db("coverage.db");
+    end
+
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 7);
+    CHECK(diags[0].code == diag::UndefineBuiltinDirective);
+    CHECK(diags[1].code == diag::TooManyArguments);
+    CHECK(diags[2].code == diag::NoImplicitConversion);
+    CHECK(diags[3].code == diag::CouldNotResolveHierarchicalPath);
+    CHECK(diags[4].code == diag::UndeclaredIdentifier);
+    CHECK(diags[5].code == diag::ExpectedModuleInstance);
+    CHECK(diags[6].code == diag::NoImplicitConversion);
+}
+
+TEST_CASE("PLA system tasks") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    logic [0:7] mem[0:3];
+    logic [0:7] in;
+    logic [0:3] out;
+    logic [7:0] memBadOrder1[0:3];
+    logic [0:7] memBadOrder2[3:0];
+    string      memString[0:3];
+    logic [7:0] inBadOrder;
+    logic [3:0] outBadOrder;
+    int i;
+    real r;
+    logic a;
+
+    initial begin
+        $async$and$plane(mem, in, out);
+        $sync$and$array(mem, in, out, r);         // Too many arguments
+        $sync$or$array(a, in, out);               // Bad mem type
+        $async$nand$plane(memString, in, out);    // Bad mem type
+        $sync$nor$array(mem, i, out);             // Bad input type
+        $async$and$plane(mem, in, r);             // Bad output type
+        $sync$or$array(memBadOrder1, in, out);    // Bad mem bit ordering
+        $async$nand$plane(memBadOrder2, in, out); // Bad mem bit ordering
+        $sync$nor$array(mem, inBadOrder, out);    // Bad input bit ordering
+        $async$and$plane(mem, in, outBadOrder);   // Bad output bit ordering
+    end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 9);
+    CHECK(diags[0].code == diag::TooManyArguments);
+    CHECK(diags[1].code == diag::BadSystemSubroutineArg);
+    CHECK(diags[2].code == diag::BadSystemSubroutineArg);
+    CHECK(diags[3].code == diag::BadSystemSubroutineArg);
+    CHECK(diags[4].code == diag::BadSystemSubroutineArg);
+    CHECK(diags[5].code == diag::PlaRangeInAscendingOrder);
+    CHECK(diags[6].code == diag::PlaRangeInAscendingOrder);
+    CHECK(diags[7].code == diag::PlaRangeInAscendingOrder);
+    CHECK(diags[8].code == diag::PlaRangeInAscendingOrder);
+}
+
+TEST_CASE("Non-standard system funcs") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    int foo;
+    string s = $psprintf("%0d", foo);
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 1);
+    CHECK(diags[0].code == diag::NonstandardSysFunc);
 }

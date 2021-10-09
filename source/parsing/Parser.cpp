@@ -435,7 +435,11 @@ StructUnionTypeSyntax& Parser::parseStructUnion(SyntaxKind syntaxKind) {
                     break;
             }
 
-            auto& type = parseDataType();
+            bitmask<TypeOptions> typeOptions;
+            if (tagged.valid() && keyword.kind == TokenKind::UnionKeyword)
+                typeOptions = TypeOptions::AllowVoid;
+
+            auto& type = parseDataType(typeOptions);
 
             Token semi;
             auto declarators = parseDeclarators(semi);
@@ -454,8 +458,23 @@ StructUnionTypeSyntax& Parser::parseStructUnion(SyntaxKind syntaxKind) {
             addDiag(diag::ExpectedMember, closeBrace.location());
     }
 
+    auto dims = parseDimensionList();
+    if (!packed) {
+        if (!dims.empty()) {
+            SourceRange range{ dims.front()->getFirstToken().location(),
+                               dims.back()->getLastToken().range().end() };
+            addDiag(diag::PackedDimsOnUnpacked, range.start()) << range;
+        }
+
+        if (signing)
+            addDiag(diag::UnpackedSigned, signing.location()) << signing.range();
+    }
+
+    if (keyword.kind == TokenKind::StructKeyword && tagged.valid())
+        addDiag(diag::TaggedStruct, tagged.location()) << tagged.range();
+
     return factory.structUnionType(syntaxKind, keyword, tagged, packed, signing, openBrace,
-                                   buffer.copy(alloc), closeBrace, parseDimensionList());
+                                   buffer.copy(alloc), closeBrace, dims);
 }
 
 EnumTypeSyntax& Parser::parseEnum() {
@@ -754,7 +773,7 @@ MemberSyntax& Parser::parseVariableDeclaration(AttrList attributes) {
         case TokenKind::LetKeyword: {
             auto let = consume();
             auto identifier = expect(TokenKind::Identifier);
-            auto portList = parseAssertionItemPortList();
+            auto portList = parseAssertionItemPortList(SyntaxKind::LetDeclaration);
             auto equals = expect(TokenKind::Equals);
             auto& expr = parseExpression();
             return factory.letDeclaration(attributes, let, identifier, portList, equals, expr,
@@ -765,9 +784,11 @@ MemberSyntax& Parser::parseVariableDeclaration(AttrList attributes) {
         case TokenKind::NetTypeKeyword:
             return parseNetTypeDecl(attributes);
         default:
-            break;
+            return parseDataDeclaration(attributes);
     }
+}
 
+DataDeclarationSyntax& Parser::parseDataDeclaration(AttrList attributes) {
     SmallVectorSized<Token, 4> modifiers;
     SmallMap<TokenKind, Token, 4> modifierSet;
     Token lastLifetime;
@@ -823,6 +844,18 @@ MemberSyntax& Parser::parseVariableDeclaration(AttrList attributes) {
     auto declarators = parseDeclarators(semi);
 
     return factory.dataDeclaration(attributes, modifiers.copy(alloc), dataType, declarators, semi);
+}
+
+LocalVariableDeclarationSyntax& Parser::parseLocalVariableDeclaration() {
+    auto var = consumeIf(TokenKind::VarKeyword);
+    auto& dataType = parseDataType(var ? TypeOptions::AllowImplicit : TypeOptions::None);
+    if (dataType.kind == SyntaxKind::TypeReference && !var)
+        addDiag(diag::TypeRefDeclVar, dataType.getFirstToken().location());
+
+    Token semi;
+    auto declarators = parseDeclarators(semi);
+
+    return factory.localVariableDeclaration(nullptr, var, dataType, declarators, semi);
 }
 
 DeclaratorSyntax& Parser::parseDeclarator(bool allowMinTypMax, bool requireInitializers) {
@@ -983,19 +1016,19 @@ PortConnectionSyntax& Parser::parsePortConnection() {
         auto dot = consume();
         auto name = expect(TokenKind::Identifier);
 
-        ExpressionSyntax* expr = nullptr;
+        PropertyExprSyntax* expr = nullptr;
         Token openParen, closeParen;
 
         if (peek(TokenKind::OpenParenthesis)) {
             openParen = consume();
             if (!peek(TokenKind::CloseParenthesis))
-                expr = &parseExpression();
+                expr = &parsePropertyExpr(0);
 
             closeParen = expect(TokenKind::CloseParenthesis);
         }
         return factory.namedPortConnection(attributes, dot, name, openParen, expr, closeParen);
     }
-    return factory.orderedPortConnection(attributes, parseExpression());
+    return factory.orderedPortConnection(attributes, parsePropertyExpr(0));
 }
 
 bool Parser::isPortDeclaration() {
@@ -1105,6 +1138,69 @@ bool Parser::isVariableDeclaration() {
         // some cases might be a cast expression
         case TokenKind::StringKeyword:
         case TokenKind::ConstKeyword:
+        case TokenKind::BitKeyword:
+        case TokenKind::LogicKeyword:
+        case TokenKind::RegKeyword:
+        case TokenKind::ByteKeyword:
+        case TokenKind::ShortIntKeyword:
+        case TokenKind::IntKeyword:
+        case TokenKind::LongIntKeyword:
+        case TokenKind::IntegerKeyword:
+        case TokenKind::TimeKeyword:
+        case TokenKind::ShortRealKeyword:
+        case TokenKind::RealKeyword:
+        case TokenKind::RealTimeKeyword: {
+            auto next = peek(++index).kind;
+            return next != TokenKind::Apostrophe && next != TokenKind::ApostropheOpenBrace;
+        }
+
+        // if this is the type operator it's technically not allowed to be a variable
+        // declaration without a "var" prefix, but we'll try to allow it anyway and
+        // diagnose it later with a better error message.
+        case TokenKind::TypeKeyword: {
+            if (peek(++index).kind != TokenKind::OpenParenthesis)
+                return false;
+
+            index++;
+            if (!scanTypePart<isNotInType>(index, TokenKind::OpenParenthesis,
+                                           TokenKind::CloseParenthesis)) {
+                return false;
+            }
+            return peek(index).kind == TokenKind::Identifier;
+        }
+
+        default:
+            break;
+    }
+
+    if (!scanQualifiedName(index, /* allowNew */ false))
+        return false;
+
+    // might be a list of dimensions here
+    if (!scanDimensionList(index))
+        return false;
+
+    // next token is the decider; declarations must have an identifier here
+    // and there can't be an open parenthesis right after it.
+    return peek(index).kind == TokenKind::Identifier &&
+           peek(index + 1).kind != TokenKind::OpenParenthesis;
+}
+
+bool Parser::isLocalVariableDeclaration() {
+    uint32_t index = 0;
+    auto kind = peek(index).kind;
+    switch (kind) {
+        case TokenKind::VarKeyword:
+        case TokenKind::CHandleKeyword:
+        case TokenKind::EventKeyword:
+        case TokenKind::StructKeyword:
+        case TokenKind::UnionKeyword:
+        case TokenKind::EnumKeyword:
+        case TokenKind::VirtualKeyword:
+            return true;
+
+        // some cases might be a cast expression
+        case TokenKind::StringKeyword:
         case TokenKind::BitKeyword:
         case TokenKind::LogicKeyword:
         case TokenKind::RegKeyword:

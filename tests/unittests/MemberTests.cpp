@@ -257,6 +257,14 @@ module Top;
     function logic func(logic bar);
     endfunction
 
+    initial begin
+        randsequence()
+            a: case (f) 0, 1: b("hello"); default: c; endcase | c;
+            b(string s): { $display(s); };
+            c: { break; };
+        endsequence
+    end
+
 endmodule
 
 module Child(I.m i, input logic f = 1);
@@ -285,6 +293,12 @@ module test_enum;
     } STATE;
 
     STATE a = STATE_0;
+
+    class C;
+        int i;
+    endclass
+
+    C c = new;
 endmodule
 )");
 
@@ -332,20 +346,39 @@ endmodule
           {
             "name": "a",
             "kind": "Variable",
-            "type": {
-              "name": "STATE",
-              "kind": "TypeAlias",
-              "target": "enum{STATE_0=1'd0,STATE_1=1'd1}test_enum.e$1"
-            },
+            "type": "enum{STATE_0=1'd0,STATE_1=1'd1}test_enum.STATE",
             "initializer": {
               "kind": "NamedValue",
-              "type": {
-                "name": "STATE",
-                "kind": "TypeAlias",
-                "target": "enum{STATE_0=1'd0,STATE_1=1'd1}test_enum.e$1"
-              },
+              "type": "enum{STATE_0=1'd0,STATE_1=1'd1}test_enum.STATE",
               "symbol": "STATE_0",
               "constant": "1'b0"
+            },
+            "lifetime": "Static",
+            "isConstant": false,
+            "isCompilerGenerated": false
+          },
+          {
+            "name": "C",
+            "kind": "ClassType",
+            "members": [
+              {
+                "name": "i",
+                "kind": "ClassProperty",
+                "type": "int",
+                "lifetime": "Automatic",
+                "isConstant": false,
+                "isCompilerGenerated": false,
+                "visibility": "Public"
+              }
+            ]
+          },
+          {
+            "name": "c",
+            "kind": "Variable",
+            "type": "C",
+            "initializer": {
+              "kind": "NewClass",
+              "type": "C"
             },
             "lifetime": "Static",
             "isConstant": false,
@@ -1135,6 +1168,23 @@ source:11:9: note: $info encountered:           43.200000 top.asdf:m Hello world
 )");
 }
 
+TEST_CASE("Elaboration task non-const args") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    int foo = 4;
+    $info("%d %d", 3, foo);
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 2);
+    CHECK(diags[0].code == diag::InfoTask);
+    CHECK(diags[1].code == diag::ConstEvalNonConstVariable);
+}
+
 TEST_CASE("Const variable must provide initializer") {
     auto tree = SyntaxTree::fromText(R"(
 module m;
@@ -1373,6 +1423,8 @@ module m;
         return u(l);
     endfunction
     function int f5; return asdf.v(); endfunction
+
+    if (t()) begin end
 endmodule
 )");
 
@@ -1380,12 +1432,13 @@ endmodule
     compilation.addSyntaxTree(tree);
 
     auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 5);
+    REQUIRE(diags.size() == 6);
     CHECK(diags[0].code == diag::ConstEvalDPINotConstant);
     CHECK(diags[1].code == diag::ConstEvalVoidNotConstant);
     CHECK(diags[2].code == diag::TaskFromFunction);
     CHECK(diags[3].code == diag::ConstEvalFunctionArgDirection);
     CHECK(diags[4].code == diag::ConstEvalFunctionInsideGenerate);
+    CHECK(diags[5].code == diag::ConstEvalTaskNotConstant);
 }
 
 TEST_CASE("Subroutine ref arguments") {
@@ -1423,6 +1476,7 @@ module m;
         const ref int b;
         ref int c;
         ref int d;
+        ref logic e;
     endfunction
 
     const int a = 1;
@@ -1430,7 +1484,7 @@ module m;
     logic [3:0] c;
     
     initial begin
-        foo(a, a + 2, b, c);
+        foo(a, a + 2, b, c, c[0]);
     end
 
     function void bar;
@@ -1445,13 +1499,14 @@ endmodule
     compilation.addSyntaxTree(tree);
 
     auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 6);
+    REQUIRE(diags.size() == 7);
     CHECK(diags[0].code == diag::ConstVarToRef);
     CHECK(diags[1].code == diag::InvalidRefArg);
     CHECK(diags[2].code == diag::InvalidRefArg);
     CHECK(diags[3].code == diag::RefTypeMismatch);
-    CHECK(diags[4].code == diag::RefArgAutomaticFunc);
+    CHECK(diags[4].code == diag::InvalidRefArg);
     CHECK(diags[5].code == diag::RefArgAutomaticFunc);
+    CHECK(diags[6].code == diag::RefArgAutomaticFunc);
 }
 
 TEST_CASE("specparams") {
@@ -1871,4 +1926,186 @@ endmodule
     Compilation compilation;
     compilation.addSyntaxTree(tree);
     NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Let declarations") {
+    auto tree = SyntaxTree::fromText(R"(
+module m1;
+    logic clk, a, b;
+    logic p, q, r;
+
+    // let with formal arguments and default value on y
+    let eq(x, y = b) = x == y;
+
+    // without parameters, binds to a, b above
+    let tmp = a && b;
+    a1: assert property (@(posedge clk) eq(p,q));
+    always_comb begin 
+        a2: assert (eq(r)); // use default for y
+        a3: assert (tmp);
+    end 
+endmodule : m1
+
+module m2;
+    logic x = 1'b1;
+    logic a, b;
+    let y = x;
+
+    always_comb begin 
+        // y binds to preceding definition of x
+        // in the declarative context of let
+        automatic bit x = 1'b0;
+        b = a | y;
+    end 
+endmodule : m2
+
+module m3;
+    logic a, b;
+    let x = a || b;
+    sequence s;
+        x ##1 b;
+    endsequence : s
+endmodule : m3
+
+module m4;
+    wire a, b;
+    wire [2:0] c;
+    wire [2:0] d;
+    wire e;
+    for (genvar i = 0; i < 3; i++) begin : L0
+        if (i != 1) begin : L1
+            let my_let(x) = !x || b && c[i];
+            assign d[2 - i] = my_let(a); // OK
+        end : L1
+    end : L0
+endmodule : m4
+
+module m5(input clock);
+    logic [15:0] a, b;
+    logic c, d;
+    typedef bit [15:0] bits;
+    
+    let ones_match(bits x, y) = x == y;
+    let same(logic x, y) = x === y;
+    always_comb a1: assert(ones_match(a, b));
+
+    property toggles(bit x, y);
+        same(x, y) |=> !same(x, y);
+    endproperty
+
+    a2: assert property (@(posedge clock) toggles(c, d));
+endmodule : m5
+
+module m6(input clock);
+    logic a;
+    let p1(x) = $past(x);
+    let p2(x) = $past(x,,,@(posedge clock));
+    let s(x) = $sampled(x);
+    always_comb begin 
+        a1: assert(p1(a));
+        a2: assert(p2(a));
+        a3: assert(s(a));
+    end 
+    a4: assert property(@(posedge clock) p1(a));
+endmodule : m6
+
+package pex_gen9_common_expressions;
+    let valid_arb(request, valid, override) = |(request & valid) || override;
+endpackage
+
+module my_checker;
+    import pex_gen9_common_expressions::*;
+    logic a, b;
+    wire [1:0] req;
+    wire [1:0] vld;
+    logic ovr;
+    if (valid_arb(.request(req), .valid(vld), .override(ovr))) begin 
+    end 
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Let declaration errors") {
+    auto tree = SyntaxTree::fromText(R"(
+module test;
+    let foo(a, local b, input c, sequence d, int e) = a || b;
+    let bar = bar;
+    let baz = a + 1;
+endmodule
+
+module m;
+    wire a, b;
+    wire [2:0] c;
+    wire [2:0] d;
+    wire e;
+    for (genvar i = 0; i < 3; i++) begin : L0
+        if (i !=1) begin : L1
+            let my_let(x) = !x || b && c[i];
+            assign d[2 - i] = my_let(a); // OK
+        end : L1
+    end : L0
+    assign e = L0[0].L1.my_let(a); // Illegal
+endmodule : m
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 6);
+    CHECK(diags[0].code == diag::UnexpectedLetPortKeyword);
+    CHECK(diags[1].code == diag::UnexpectedLetPortKeyword);
+    CHECK(diags[2].code == diag::PropertyPortInLet);
+    CHECK(diags[3].code == diag::RecursiveLet);
+    CHECK(diags[4].code == diag::UndeclaredIdentifier);
+    CHECK(diags[5].code == diag::LetHierarchical);
+}
+
+TEST_CASE("Param initialize self-reference") {
+    auto tree = SyntaxTree::fromText(R"(
+parameter int foo = foo;
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 1);
+    CHECK(diags[0].code == diag::UsedBeforeDeclared);
+}
+
+TEST_CASE("Param reference in implicit dimension specification") {
+    auto tree = SyntaxTree::fromText(R"(
+module m #(parameter foo = 1, parameter [foo-1:0] bar = '0)();
+    localparam p = bar;
+endmodule
+
+module n;
+    m #(.bar(50)) m1();
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Param sum with regression GH #432") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    parameter logic [7:0] m1 [2] = '{ 5, 10 };
+    parameter int y1 = m1.sum with(item);
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+
+    auto cv = compilation.getRoot().lookupName<ParameterSymbol>("m.y1").getValue();
+    CHECK(cv.integer() == 15);
 }

@@ -13,6 +13,9 @@
 
 namespace slang {
 
+struct RsCodeBlockSyntax;
+struct RsRuleSyntax;
+
 class StatementBlockSymbol : public Symbol, public Scope {
 public:
     StatementBlockKind blockKind;
@@ -36,6 +39,10 @@ public:
     static StatementBlockSymbol& fromSyntax(const Scope& scope,
                                             const ForeachLoopStatementSyntax& syntax,
                                             bitmask<StatementFlags> flags);
+    static StatementBlockSymbol& fromSyntax(const Scope& scope,
+                                            const RandSequenceStatementSyntax& syntax);
+    static StatementBlockSymbol& fromSyntax(const Scope& scope, const RsRuleSyntax& syntax);
+    static StatementBlockSymbol& fromSyntax(const Scope& scope, const RsCodeBlockSyntax& syntax);
     static StatementBlockSymbol& fromLabeledStmt(const Scope& scope, const StatementSyntax& syntax,
                                                  bitmask<StatementFlags> flags);
 
@@ -114,12 +121,12 @@ public:
     void serializeTo(ASTSerializer& serializer) const;
 
     static void fromSyntax(Compilation& compilation, const IfGenerateSyntax& syntax,
-                           LookupLocation location, const Scope& parent, uint32_t constructIndex,
-                           bool isInstantiated, SmallVector<GenerateBlockSymbol*>& results);
+                           const BindContext& context, uint32_t constructIndex, bool isInstantiated,
+                           SmallVector<GenerateBlockSymbol*>& results);
 
     static void fromSyntax(Compilation& compilation, const CaseGenerateSyntax& syntax,
-                           LookupLocation location, const Scope& parent, uint32_t constructIndex,
-                           bool isInstantiated, SmallVector<GenerateBlockSymbol*>& results);
+                           const BindContext& context, uint32_t constructIndex, bool isInstantiated,
+                           SmallVector<GenerateBlockSymbol*>& results);
 
     static GenerateBlockSymbol& fromSyntax(const Scope& scope, const GenerateBlockSyntax& syntax,
                                            uint32_t constructIndex);
@@ -153,8 +160,8 @@ public:
     /// Creates a generate block array from the given loop-generate syntax node.
     static GenerateBlockArraySymbol& fromSyntax(Compilation& compilation,
                                                 const LoopGenerateSyntax& syntax,
-                                                SymbolIndex scopeIndex, LookupLocation location,
-                                                const Scope& parent, uint32_t constructIndex);
+                                                SymbolIndex scopeIndex, const BindContext& context,
+                                                uint32_t constructIndex);
 
     static bool isKind(SymbolKind kind) { return kind == SymbolKind::GenerateBlockArray; }
 };

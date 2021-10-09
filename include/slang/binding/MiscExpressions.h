@@ -6,14 +6,12 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "slang/binding/AssertionExpr.h"
 #include "slang/binding/Expression.h"
+#include "slang/binding/TimingControl.h"
 #include "slang/symbols/ValueSymbol.h"
 
 namespace slang {
-
-class AssertionExpr;
-class Constraint;
-class TimingControl;
 
 /// Common base class for both NamedValueExpression and HierarchicalValueExpression.
 class ValueExpressionBase : public Expression {
@@ -62,123 +60,6 @@ public:
     bool verifyConstantImpl(EvalContext& context) const;
 
     static bool isKind(ExpressionKind kind) { return kind == ExpressionKind::HierarchicalValue; }
-};
-
-struct ArgumentListSyntax;
-
-/// Represents a subroutine call.
-class CallExpression : public Expression {
-public:
-    struct IteratorCallInfo {
-        const Expression* iterExpr = nullptr;
-        const ValueSymbol* iterVar = nullptr;
-    };
-
-    struct RandomizeCallInfo {
-        const Constraint* inlineConstraints = nullptr;
-        span<const string_view> constraintRestrictions;
-    };
-
-    struct SystemCallInfo {
-        not_null<const SystemSubroutine*> subroutine;
-        not_null<const Scope*> scope;
-        std::variant<std::monostate, IteratorCallInfo, RandomizeCallInfo> extraInfo;
-
-        std::pair<const Expression*, const ValueSymbol*> getIteratorInfo() const;
-    };
-
-    using Subroutine = std::variant<const SubroutineSymbol*, SystemCallInfo>;
-    Subroutine subroutine;
-
-    CallExpression(const Subroutine& subroutine, const Type& returnType,
-                   const Expression* thisClass, span<const Expression*> arguments,
-                   LookupLocation lookupLocation, SourceRange sourceRange) :
-        Expression(ExpressionKind::Call, returnType, sourceRange),
-        subroutine(subroutine), thisClass_(thisClass), arguments_(arguments),
-        lookupLocation(lookupLocation) {}
-
-    /// If this call is for a class method, returns the expression representing the
-    /// class handle on which the method is being invoked. Otherwise returns nullptr.
-    const Expression* thisClass() const { return thisClass_; }
-
-    span<const Expression* const> arguments() const { return arguments_; }
-    span<const Expression*> arguments() { return arguments_; }
-
-    bool isSystemCall() const { return subroutine.index() == 1; }
-
-    string_view getSubroutineName() const;
-    SubroutineKind getSubroutineKind() const;
-
-    ConstantValue evalImpl(EvalContext& context) const;
-    bool verifyConstantImpl(EvalContext& context) const;
-
-    void serializeTo(ASTSerializer& serializer) const;
-
-    static Expression& fromSyntax(Compilation& compilation,
-                                  const InvocationExpressionSyntax& syntax,
-                                  const ArrayOrRandomizeMethodExpressionSyntax* withClause,
-                                  const BindContext& context);
-
-    static Expression& fromSyntax(Compilation& compilation,
-                                  const ArrayOrRandomizeMethodExpressionSyntax& syntax,
-                                  const BindContext& context);
-
-    static Expression& fromLookup(Compilation& compilation, const Subroutine& subroutine,
-                                  const Expression* thisClass,
-                                  const InvocationExpressionSyntax* syntax,
-                                  const ArrayOrRandomizeMethodExpressionSyntax* withClause,
-                                  SourceRange range, const BindContext& context);
-
-    static Expression& fromArgs(Compilation& compilation, const Subroutine& subroutine,
-                                const Expression* thisClass, const ArgumentListSyntax* argSyntax,
-                                SourceRange range, const BindContext& context);
-
-    static Expression& fromSystemMethod(Compilation& compilation, const Expression& expr,
-                                        const LookupResult::MemberSelector& selector,
-                                        const InvocationExpressionSyntax* syntax,
-                                        const ArrayOrRandomizeMethodExpressionSyntax* withClause,
-                                        const BindContext& context);
-
-    static Expression* fromBuiltInMethod(Compilation& compilation, SymbolKind rootKind,
-                                         const Expression& expr,
-                                         const LookupResult::MemberSelector& selector,
-                                         const InvocationExpressionSyntax* syntax,
-                                         const ArrayOrRandomizeMethodExpressionSyntax* withClause,
-                                         const BindContext& context);
-
-    static bool isKind(ExpressionKind kind) { return kind == ExpressionKind::Call; }
-
-    template<typename TVisitor>
-    void visitExprs(TVisitor&& visitor) const {
-        if (thisClass())
-            thisClass()->visit(visitor);
-
-        for (auto arg : arguments())
-            arg->visit(visitor);
-    }
-
-private:
-    static Expression& fromSyntaxImpl(Compilation& compilation, const ExpressionSyntax& left,
-                                      const InvocationExpressionSyntax* invocation,
-                                      const ArrayOrRandomizeMethodExpressionSyntax* withClause,
-                                      const BindContext& context);
-
-    static Expression& createSystemCall(Compilation& compilation,
-                                        const SystemSubroutine& subroutine,
-                                        const Expression* firstArg,
-                                        const InvocationExpressionSyntax* syntax,
-                                        const ArrayOrRandomizeMethodExpressionSyntax* withClause,
-                                        SourceRange range, const BindContext& context,
-                                        const Scope* randomizeScope = nullptr);
-
-    static bool checkConstant(EvalContext& context, const SubroutineSymbol& subroutine,
-                              SourceRange range);
-
-    const Expression* thisClass_;
-    span<const Expression*> arguments_;
-    LookupLocation lookupLocation;
-
-    mutable bool inRecursion = false;
 };
 
 /// Adapts a data type for use in an expression tree. This is for cases where both an expression
@@ -278,15 +159,15 @@ public:
 
 struct ClockingPropertyExprSyntax;
 
-/// Represents a clocking event argument. This is a special kind of argument that is only
-/// allowed with the sampled value system functions.
-class ClockingArgumentExpression : public Expression {
+/// Represents a clocking event expression. This is a special kind of expression that is only
+/// allowed with the sampled value system functions and assertion instance arguments.
+class ClockingEventExpression : public Expression {
 public:
     const TimingControl& timingControl;
 
-    ClockingArgumentExpression(const Type& type, const TimingControl& timingControl,
-                               SourceRange sourceRange) :
-        Expression(ExpressionKind::ClockingArgument, type, sourceRange),
+    ClockingEventExpression(const Type& type, const TimingControl& timingControl,
+                            SourceRange sourceRange) :
+        Expression(ExpressionKind::ClockingEvent, type, sourceRange),
         timingControl(timingControl) {}
 
     ConstantValue evalImpl(EvalContext&) const { return nullptr; }
@@ -297,20 +178,30 @@ public:
 
     void serializeTo(ASTSerializer& serializer) const;
 
-    static bool isKind(ExpressionKind kind) { return kind == ExpressionKind::ClockingArgument; }
+    static bool isKind(ExpressionKind kind) { return kind == ExpressionKind::ClockingEvent; }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        timingControl.visit(visitor);
+    }
 };
 
 /// Represents an instance of an assertion item, either a sequence, a property,
 /// or a formal argument that is being referenced and expanded.
 class AssertionInstanceExpression : public Expression {
 public:
+    using ActualArg = std::variant<const Expression*, const AssertionExpr*, const TimingControl*>;
+
     const Symbol& symbol;
     const AssertionExpr& body;
+    span<std::tuple<const Symbol*, ActualArg> const> arguments;
+    span<const Symbol* const> localVars;
+    bool isRecursiveProperty;
 
     AssertionInstanceExpression(const Type& type, const Symbol& symbol, const AssertionExpr& body,
-                                SourceRange sourceRange) :
+                                bool isRecursiveProperty, SourceRange sourceRange) :
         Expression(ExpressionKind::AssertionInstance, type, sourceRange),
-        symbol(symbol), body(body) {}
+        symbol(symbol), body(body), isRecursiveProperty(isRecursiveProperty) {}
 
     ConstantValue evalImpl(EvalContext&) const { return nullptr; }
     bool verifyConstantImpl(EvalContext&) const { return false; }
@@ -318,12 +209,25 @@ public:
     static Expression& fromLookup(const Symbol& symbol, const InvocationExpressionSyntax* syntax,
                                   SourceRange range, const BindContext& context);
 
+    static Expression& makeDefault(const Symbol& symbol);
+
     static Expression& bindPort(const Symbol& symbol, SourceRange range,
                                 const BindContext& context);
 
     void serializeTo(ASTSerializer& serializer) const;
 
     static bool isKind(ExpressionKind kind) { return kind == ExpressionKind::AssertionInstance; }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        body.visit(visitor);
+        for (auto sym : localVars) {
+            auto dt = sym->getDeclaredType();
+            ASSERT(dt);
+            if (auto init = dt->getInitializer())
+                init->visit(visitor);
+        }
+    }
 };
 
 struct MinTypMaxExpressionSyntax;
@@ -451,6 +355,37 @@ public:
 private:
     const Expression* left_;
     span<DistItem> items_;
+};
+
+struct TaggedUnionExpressionSyntax;
+
+/// Represents a tagged union member setter expression.
+class TaggedUnionExpression : public Expression {
+public:
+    const Symbol& member;
+    const Expression* valueExpr;
+
+    TaggedUnionExpression(const Type& type, const Symbol& member, const Expression* valueExpr,
+                          SourceRange sourceRange) :
+        Expression(ExpressionKind::TaggedUnion, type, sourceRange),
+        member(member), valueExpr(valueExpr) {}
+
+    ConstantValue evalImpl(EvalContext& context) const;
+    bool verifyConstantImpl(EvalContext& context) const;
+
+    void serializeTo(ASTSerializer& serializer) const;
+
+    static Expression& fromSyntax(Compilation& compilation,
+                                  const TaggedUnionExpressionSyntax& syntax,
+                                  const BindContext& context, const Type* assignmentTarget);
+
+    static bool isKind(ExpressionKind kind) { return kind == ExpressionKind::TaggedUnion; }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        if (valueExpr)
+            valueExpr->visit(visitor);
+    }
 };
 
 } // namespace slang

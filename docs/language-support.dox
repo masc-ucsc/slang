@@ -49,7 +49,7 @@ LRM | Feature | Supported
 {{m-success}} 6.5 | Nets and variables | v0.2
 {{m-success}} 6.6 | Net types | v0.2
 {{m-warning}} 6.6.7 | User-defined nettypes | partial
-{{m-danger}}  6.6.8 | Generic interconnect | no
+{{m-warning}} 6.6.8 | Generic interconnect | partial
 {{m-success}} 6.7 | Net declarations | v0.6
 {{m-success}} 6.8 | Variable declarations | v0.2
 {{m-success}} 6.9 | Vector declarations | v0.2
@@ -64,7 +64,7 @@ LRM | Feature | Supported
 {{m-success}} 6.18 | User-defined types | v0.2
 {{m-success}} 6.19 | Enumerations | v0.2
 {{m-success}} 6.20.2 | Value parameters | v0.2
-{{m-danger}}  6.20.2.1 | $ as a parameter value | no
+{{m-success}} 6.20.2.1 | $ as a parameter value | v0.8
 {{m-success}} 6.20.3 | Type parameters | v0.2
 {{m-success}} 6.20.4 | Local parameters | v0.2
 {{m-success}} 6.20.5 | Specify parameters | v0.7
@@ -82,7 +82,7 @@ LRM | Feature | Supported
 LRM | Feature | Supported
 --- | ------- | ---------
 {{m-success}} 7.2 | Structures | v0.2
-{{m-warning}} 7.3 | Unions | partial
+{{m-success}} 7.3 | Unions | v0.9
 {{m-success}} 7.4 | Packed and unpacked arrays | v0.2
 {{m-success}} 7.5 | Dynamic arrays | v0.4
 {{m-success}} 7.6 | Array assignments | v0.2
@@ -140,9 +140,9 @@ LRM | Feature | Supported
 {{m-success}} 9.4.1 | Delay control | v0.2
 {{m-success}} 9.4.2 | Event control | v0.2
 {{m-success}} 9.4.2.3 | Conditional event controls | v0.6
-{{m-danger}}  9.4.2.4 | Sequence events | no
+{{m-success}} 9.4.2.4 | Sequence events | v0.8
 {{m-success}} 9.4.3 | Level-sensitive event control | v0.6
-{{m-danger}}  9.4.4 | Level-sensitive sequence controls | no
+{{m-success}} 9.4.4 | Level-sensitive sequence controls | v0.8
 {{m-success}} 9.4.5 | Intra-assignment timing controls | v0.6
 {{m-dim}}     9.5 | Process execution threads | N/A
 {{m-success}} 9.6.1 | Wait fork statement | v0.4
@@ -175,10 +175,10 @@ LRM | Feature | Supported
 {{m-success}} 11.6 | Expression bit lengths | v0.2
 {{m-success}} 11.7 | Signed expressions | v0.2
 {{m-success}} 11.8 | Expression evaluation rules | v0.2
-{{m-danger}}  11.9 | Tagged union expressions | no
+{{m-success}} 11.9 | Tagged union expressions | v0.9
 {{m-success}} 11.10 | String literal expressions | v0.5
 {{m-success}} 11.11 | Min/typ/max expressions | v0.4
-{{m-danger}}  11.12 | Let construct | no
+{{m-success}} 11.12 | Let construct | v0.9
 
 ## 12. Procedural programming statements
 
@@ -240,20 +240,22 @@ LRM | Feature | Supported
 LRM | Feature | Supported
 --- | ------- | ---------
 {{m-success}} 16.3 | Immediate assertions | v0.2
-{{m-warning}} 16.4 | Deferred assertions | partial
+{{m-success}} 16.4 | Deferred assertions | v0.8
 {{m-success}} 16.5 | Concurrent assertions overview | v0.8
 {{m-success}} 16.6 | Boolean expressions | v0.8
 {{m-success}} 16.7 | Sequences | v0.8
-{{m-warning}} 16.8 | Declaring sequences | partial
-{{m-warning}} 16.9 | Sequence operations | partial
-{{m-danger}}  16.10 | Local variables | no
-{{m-danger}}  16.11 | Calling subroutines on match of sequence | no
-{{m-warning}} 16.12 | Declaring properties | partial
-{{m-danger}}  16.13 | Multiclock support | no
-{{m-warning}} 16.14 | Concurrent assertions | partial
-{{m-danger}}  16.15 | Disable iff resolution | no
+{{m-success}} 16.8 | Declaring sequences | v0.8
+{{m-success}} 16.9 | Sequence operations | v0.8
+{{m-success}} 16.10 | Local variables | v0.8
+{{m-success}} 16.11 | Calling subroutines on match of sequence | v0.8
+{{m-success}} 16.12 | Declaring properties | v0.8
+{{m-warning}} 16.12.22 | Nondegeneracy | partial
+{{m-warning}} 16.13 | Multiclock support | partial
+{{m-success}} 16.14 | Concurrent assertions | v0.8
+{{m-danger}}  16.14.7 | Inferred value functions | no
+{{m-success}} 16.15 | Disable iff resolution | v0.8
 {{m-danger}}  16.16 | Clock resolution | no
-{{m-danger}}  16.17 | Expect statement | no
+{{m-success}} 16.17 | Expect statement | v0.8
 {{m-dim}}     16.18 | Clocking blocks and concurrent assertions | N/A
 
 ## 17. Checkers
@@ -286,8 +288,8 @@ LRM | Feature | Supported
 {{m-success}} 18.13 | Random number system functions | v0.6
 {{m-dim}}     18.14 | Random stability | N/A
 {{m-dim}}     18.15 | Manually seeding randomize | N/A
-{{m-danger}}  18.16 | Random weighted case | no
-{{m-danger}}  18.17 | Random sequence generation | no
+{{m-success}} 18.16 | Random weighted case | v0.9
+{{m-success}} 18.17 | Random sequence generation | v0.9
 
 ## 19. Functional coverage
 
@@ -299,7 +301,7 @@ LRM | Feature | Supported
 {{m-danger}} 19.6 | Defining cross coverage | no
 {{m-danger}} 19.7 | Specifying coverage options | no
 {{m-danger}} 19.8 | Predefined coverage methods | no
-{{m-danger}} 19.9 | Predefined coverage system tasks | no
+{{m-success}} 19.9 | Predefined coverage system tasks | v0.9
 {{m-danger}} 19.10 | Organization of option members | no
 {{m-dim}}    19.11 | Coverage computation | N/A
 
@@ -312,7 +314,7 @@ LRM | Feature | Supported
 {{m-success}} 20.4 | Timescale tasks | v0.4
 {{m-success}} 20.5 | Conversion functions | v0.2
 {{m-success}} 20.6 | Data query functions | v0.3
-{{m-danger}}  20.6.1 | Range system function | no
+{{m-success}} 20.6.1 | Range system function | v0.8
 {{m-success}} 20.7 | Array query functions | v0.4
 {{m-success}} 20.8 | Math functions | v0.2
 {{m-success}} 20.9 | Bit vector system functions | v0.2
@@ -320,10 +322,10 @@ LRM | Feature | Supported
 {{m-success}} 20.11 | Elaboration tasks | v0.5
 {{m-success}} 20.12 | Assertion control tasks | v0.6
 {{m-success}} 20.13 | Sampled value system functions | v0.8
-{{m-danger}}  20.14 | Coverage control functions | no
+{{m-success}} 20.14 | Coverage control functions | v0.9
 {{m-success}} 20.15 | Probabilistic distribution functions | v0.7
 {{m-success}} 20.16 | Stochastic analysis tasks and functions | v0.7
-{{m-danger}}  20.17 | PLA modeling tasks | no
+{{m-success}} 20.17 | PLA modeling tasks | v0.9
 {{m-success}} 20.18 | Miscellaneous tasks and functions | v0.4
 
 ## 21. Input/output system tasks and system functions
@@ -408,7 +410,7 @@ LRM | Feature | Supported
 {{m-success}} 26.3 | Referencing data in packages | v0.2
 {{m-success}} 26.4 | Using packages in module headers | v0.2
 {{m-success}} 26.5 | Search order rules | v0.2
-{{m-danger}}  26.6 | Exporting imported names from packages | no
+{{m-success}} 26.6 | Exporting imported names from packages | v0.9
 {{m-success}} 26.7 | The std built-in package | v0.6
 
 ## 27. Generate constructs

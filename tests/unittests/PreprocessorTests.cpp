@@ -1098,6 +1098,34 @@ TEST_CASE("Invalid `line directive") {
     CHECK(diagnostics[0].code == diag::InvalidLineDirectiveLevel);
 }
 
+TEST_CASE("Coverage macros") {
+    PreprocessorOptions ppOptions;
+    Bag options;
+    options.set(ppOptions);
+    Preprocessor pp(getSourceManager(), alloc, diagnostics, options);
+
+    CHECK(pp.isDefined("SV_COV_START"));
+    CHECK(pp.isDefined("SV_COV_STOP"));
+    CHECK(pp.isDefined("SV_COV_RESET"));
+    CHECK(pp.isDefined("SV_COV_CHECK"));
+    CHECK(pp.isDefined("SV_COV_MODULE"));
+    CHECK(pp.isDefined("SV_COV_HIER"));
+    CHECK(pp.isDefined("SV_COV_ASSERTION"));
+    CHECK(pp.isDefined("SV_COV_FSM_STATE"));
+    CHECK(pp.isDefined("SV_COV_STATEMENT"));
+    CHECK(pp.isDefined("SV_COV_TOGGLE"));
+    CHECK(pp.isDefined("SV_COV_OVERFLOW"));
+    CHECK(pp.isDefined("SV_COV_ERROR"));
+    CHECK(pp.isDefined("SV_COV_NOCOV"));
+    CHECK(pp.isDefined("SV_COV_OK"));
+    CHECK(pp.isDefined("SV_COV_PARTIAL"));
+
+    auto& text = "`SV_COV_OK\n";
+    Token token = lexToken(text);
+    REQUIRE(token.kind == TokenKind::IntegerLiteral);
+    CHECK_DIAGNOSTICS_EMPTY;
+}
+
 TEST_CASE("undef Directive") {
     auto& text = "`define FOO 45\n"
                  "`undef FOO\n"
@@ -1337,7 +1365,7 @@ TEST_CASE("Preprocessor API") {
     CHECK(!pp.isDefined("BUZ"));
 
     pp.setKeywordVersion(KeywordVersion::v1364_2001);
-    CHECK(pp.getDefinedMacros().size() == 5);
+    CHECK(pp.getDefinedMacros().size() == 20);
 }
 
 TEST_CASE("Undef builtin") {
@@ -1659,4 +1687,164 @@ endmodule
 
     std::string result = preprocess(text);
     CHECK(result == expected);
+    CHECK_DIAGNOSTICS_EMPTY;
+}
+
+TEST_CASE("Macro named with keyword") {
+    auto& text = R"(
+`define const const
+`const
+)";
+
+    auto& expected = R"(
+const
+)";
+
+    std::string result = preprocess(text);
+    CHECK(result == expected);
+    CHECK_DIAGNOSTICS_EMPTY;
+}
+
+TEST_CASE("Preproc stringify assertion regress GH #451") {
+    auto& text = R"(
+`define FOO (* instance_name = `"\inst_``NAME`" *)
+`FOO
+)";
+
+    // Just test that no assert is hit.
+    preprocess(text);
+}
+
+TEST_CASE("Macro inside an escaped identifier") {
+    auto& text = R"(
+`define MAKE_INST(NAME, SIG) \
+    (* instance_name = `"inst_``NAME`" *) \
+    mod \inst_``NAME (.sig(SIG));
+
+module mod(input logic sig);
+endmodule
+module top;
+    logic sig1, sig2;
+    `MAKE_INST(A, sig1)
+    `MAKE_INST(B, sig2)
+endmodule
+)";
+
+    std::string result = preprocess(text);
+    CHECK(result == R"(
+module mod(input logic sig);
+endmodule
+module top;
+    logic sig1, sig2;
+    
+    (* instance_name = "inst_A" *) 
+    mod \inst_A  (.sig(sig1));
+    
+    (* instance_name = "inst_B" *) 
+    mod \inst_B  (.sig(sig2));
+endmodule
+)");
+
+    auto tree = SyntaxTree::fromText(text);
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Nested macro arg escaped identifier") {
+    auto& text = R"(
+`define FOO(a, b) a: b
+`define BAR(a, b) `FOO(\asdf_``a , b)
+
+module m;
+    initial begin
+        int i;
+        `BAR([k]123, i++);
+    end
+endmodule
+)";
+
+    std::string result = preprocess(text);
+    CHECK(result == R"(
+module m;
+    initial begin
+        int i;
+        \asdf_[k]123 : i++;
+    end
+endmodule
+)");
+
+    auto tree = SyntaxTree::fromText(text);
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Macro arg concat with multiple adjacent tokens") {
+    auto& text = R"(
+`define MACRO(ARG) \
+    if (PARAM == 0) begin: size``ARG \
+        assign var_``ARG = 1'b1; \
+    end
+module top #(
+    int unsigned PARAM = 0
+) ();
+    logic var_4K;
+    `MACRO(4K)
+endmodule
+)";
+
+    std::string result = preprocess(text);
+    CHECK(result == R"(
+module top #(
+    int unsigned PARAM = 0
+) ();
+    logic var_4K;
+    
+    if (PARAM == 0) begin: size4K 
+        assign var_4K = 1'b1; 
+    end
+endmodule
+)");
+
+    auto tree = SyntaxTree::fromText(text);
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Macro defining new macro with newlines") {
+    auto& text = R"(
+`define FOO(x, y) \
+    `ifndef x \
+        `define x (y) \
+    `endif
+    
+`FOO(baz,
+    1 ?
+        0 :
+        1)
+
+module m;
+    int i = `baz;
+endmodule
+)";
+
+    std::string result = preprocess(text);
+    CHECK(result == R"(
+    
+     
+         
+    
+module m;
+    int i = (1 ?
+        0 :
+        1);
+endmodule
+)");
+
+    auto tree = SyntaxTree::fromText(text);
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
 }

@@ -6,6 +6,9 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "slang/binding/Expression.h"
+#include "slang/binding/TimingControl.h"
+#include "slang/diagnostics/Diagnostics.h"
 #include "slang/symbols/ASTSerializer.h"
 #include "slang/util/Util.h"
 
@@ -16,6 +19,7 @@ namespace slang {
     x(Invalid) \
     x(Simple) \
     x(SequenceConcat) \
+    x(SequenceWithMatch) \
     x(Unary) \
     x(Binary) \
     x(FirstMatch) \
@@ -23,7 +27,8 @@ namespace slang {
     x(StrongWeak) \
     x(Abort) \
     x(Conditional) \
-    x(Case)
+    x(Case) \
+    x(DisableIff)
 ENUM(AssertionExprKind, EXPR);
 #undef EXPR
 
@@ -59,10 +64,11 @@ ENUM(BinaryAssertionOperator, OP);
 // clang-format on
 
 class BindContext;
+class CallExpression;
 class Compilation;
 class SyntaxNode;
-class TimingControl;
 struct PropertyExprSyntax;
+struct PropertySpecSyntax;
 struct SequenceExprSyntax;
 
 class AssertionExpr {
@@ -71,10 +77,29 @@ public:
 
     const SyntaxNode* syntax = nullptr;
 
+    void requireSequence(const BindContext& context) const;
+    void requireSequence(const BindContext& context, DiagCode code) const;
     bool bad() const { return kind == AssertionExprKind::Invalid; }
 
-    static const AssertionExpr& bind(const SequenceExprSyntax& syntax, const BindContext& context);
-    static const AssertionExpr& bind(const PropertyExprSyntax& syntax, const BindContext& context);
+    /// Returns true if this is a sequence expression that admits an empty match,
+    /// and false otherwise.
+    bool admitsEmpty() const;
+
+    static const AssertionExpr& bind(const SequenceExprSyntax& syntax, const BindContext& context,
+                                     bool allowDisable = false);
+
+    static const AssertionExpr& bind(const PropertyExprSyntax& syntax, const BindContext& context,
+                                     bool allowDisable = false, bool allowSeqAdmitEmpty = false);
+
+    static const AssertionExpr& bind(const PropertySpecSyntax& syntax, const BindContext& context);
+
+    static bool checkAssertionCall(const CallExpression& call, const BindContext& context,
+                                   DiagCode outArgCode, DiagCode refArgCode,
+                                   optional<DiagCode> sysTaskCode, SourceRange range);
+
+    static void checkSampledValueExpr(const Expression& expr, const BindContext& context,
+                                      bool isFutureGlobal, DiagCode localVarCode,
+                                      DiagCode matchedCode);
 
     template<typename T>
     T& as() {
@@ -116,7 +141,7 @@ struct SequenceRepetitionSyntax;
 /// Represents a range of potential sequence matches.
 struct SequenceRange {
     /// The minimum length of the range.
-    uint32_t min = 0;
+    uint32_t min = 1;
 
     /// The maximum length of the range. If unset, the maximum is unbounded.
     optional<uint32_t> max;
@@ -125,6 +150,8 @@ struct SequenceRange {
                                     bool allowUnbounded);
     static SequenceRange fromSyntax(const RangeSelectSyntax& syntax, const BindContext& context,
                                     bool allowUnbounded);
+
+    bool admitsEmpty() const;
 
     void serializeTo(ASTSerializer& serializer) const;
 };
@@ -149,6 +176,9 @@ struct SequenceRepetition {
 
     SequenceRepetition(const SequenceRepetitionSyntax& syntax, const BindContext& context);
 
+    enum class AdmitsEmpty { Yes, No, Depends };
+    AdmitsEmpty admitsEmpty() const;
+
     void serializeTo(ASTSerializer& serializer) const;
 };
 
@@ -163,12 +193,20 @@ public:
     SimpleAssertionExpr(const Expression& expr, optional<SequenceRepetition> repetition) :
         AssertionExpr(AssertionExprKind::Simple), expr(expr), repetition(repetition) {}
 
+    void requireSequence(const BindContext& context, DiagCode code) const;
+    bool admitsEmptyImpl() const;
+
     static AssertionExpr& fromSyntax(const SimpleSequenceExprSyntax& syntax,
-                                     const BindContext& context);
+                                     const BindContext& context, bool allowDisable);
 
     void serializeTo(ASTSerializer& serializer) const;
 
     static bool isKind(AssertionExprKind kind) { return kind == AssertionExprKind::Simple; }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        expr.visit(visitor);
+    }
 };
 
 struct DelayedSequenceExprSyntax;
@@ -186,12 +224,54 @@ public:
     explicit SequenceConcatExpr(span<const Element> elements) :
         AssertionExpr(AssertionExprKind::SequenceConcat), elements(elements) {}
 
+    bool admitsEmptyImpl() const;
+
     static AssertionExpr& fromSyntax(const DelayedSequenceExprSyntax& syntax,
                                      const BindContext& context);
 
     void serializeTo(ASTSerializer& serializer) const;
 
     static bool isKind(AssertionExprKind kind) { return kind == AssertionExprKind::SequenceConcat; }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        for (auto& elem : elements)
+            elem.sequence->visit(visitor);
+    }
+};
+
+struct ParenthesizedSequenceExprSyntax;
+
+/// Represents a sequence expression along with a list of actions to perform upon matching
+/// and/or instructions for repetition.
+class SequenceWithMatchExpr : public AssertionExpr {
+public:
+    const AssertionExpr& expr;
+    optional<SequenceRepetition> repetition;
+    span<const Expression* const> matchItems;
+
+    SequenceWithMatchExpr(const AssertionExpr& expr, optional<SequenceRepetition> repetition,
+                          span<const Expression* const> matchItems) :
+        AssertionExpr(AssertionExprKind::SequenceWithMatch),
+        expr(expr), repetition(repetition), matchItems(matchItems) {}
+
+    bool admitsEmptyImpl() const;
+
+    static AssertionExpr& fromSyntax(const ParenthesizedSequenceExprSyntax& syntax,
+                                     const BindContext& context);
+
+    void serializeTo(ASTSerializer& serializer) const;
+
+    static bool isKind(AssertionExprKind kind) {
+        return kind == AssertionExprKind::SequenceWithMatch;
+    }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        expr.visit(visitor);
+        for (auto item : matchItems)
+            item->visit(visitor);
+    }
 };
 
 struct UnaryPropertyExprSyntax;
@@ -209,6 +289,8 @@ public:
         AssertionExpr(AssertionExprKind::Unary),
         op(op), expr(expr), range(range) {}
 
+    bool admitsEmptyImpl() const { return false; }
+
     static AssertionExpr& fromSyntax(const UnaryPropertyExprSyntax& syntax,
                                      const BindContext& context);
 
@@ -218,6 +300,11 @@ public:
     void serializeTo(ASTSerializer& serializer) const;
 
     static bool isKind(AssertionExprKind kind) { return kind == AssertionExprKind::Unary; }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        expr.visit(visitor);
+    }
 };
 
 struct BinarySequenceExprSyntax;
@@ -235,6 +322,9 @@ public:
         AssertionExpr(AssertionExprKind::Binary),
         op(op), left(left), right(right) {}
 
+    void requireSequence(const BindContext& context, DiagCode code) const;
+    bool admitsEmptyImpl() const;
+
     static AssertionExpr& fromSyntax(const BinarySequenceExprSyntax& syntax,
                                      const BindContext& context);
 
@@ -244,6 +334,12 @@ public:
     void serializeTo(ASTSerializer& serializer) const;
 
     static bool isKind(AssertionExprKind kind) { return kind == AssertionExprKind::Binary; }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        left.visit(visitor);
+        right.visit(visitor);
+    }
 };
 
 struct FirstMatchSequenceExprSyntax;
@@ -252,9 +348,12 @@ struct FirstMatchSequenceExprSyntax;
 class FirstMatchAssertionExpr : public AssertionExpr {
 public:
     const AssertionExpr& seq;
+    span<const Expression* const> matchItems;
 
-    FirstMatchAssertionExpr(const AssertionExpr& seq) :
-        AssertionExpr(AssertionExprKind::FirstMatch), seq(seq) {}
+    FirstMatchAssertionExpr(const AssertionExpr& seq, span<const Expression* const> matchItems) :
+        AssertionExpr(AssertionExprKind::FirstMatch), seq(seq), matchItems(matchItems) {}
+
+    bool admitsEmptyImpl() const;
 
     static AssertionExpr& fromSyntax(const FirstMatchSequenceExprSyntax& syntax,
                                      const BindContext& context);
@@ -262,10 +361,18 @@ public:
     void serializeTo(ASTSerializer& serializer) const;
 
     static bool isKind(AssertionExprKind kind) { return kind == AssertionExprKind::FirstMatch; }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        seq.visit(visitor);
+        for (auto item : matchItems)
+            item->visit(visitor);
+    }
 };
 
 struct ClockingSequenceExprSyntax;
 struct ClockingPropertyExprSyntax;
+struct SignalEventExpressionSyntax;
 
 /// Represents an assertion expression with attached clocking control.
 class ClockingAssertionExpr : public AssertionExpr {
@@ -276,15 +383,29 @@ public:
     ClockingAssertionExpr(const TimingControl& clocking, const AssertionExpr& expr) :
         AssertionExpr(AssertionExprKind::Clocking), clocking(clocking), expr(expr) {}
 
+    bool admitsEmptyImpl() const;
+
     static AssertionExpr& fromSyntax(const ClockingSequenceExprSyntax& syntax,
                                      const BindContext& context);
 
     static AssertionExpr& fromSyntax(const ClockingPropertyExprSyntax& syntax,
                                      const BindContext& context);
 
+    static AssertionExpr& fromSyntax(const SignalEventExpressionSyntax& syntax,
+                                     const BindContext& context);
+
+    static AssertionExpr& fromSyntax(const TimingControlSyntax& syntax, const AssertionExpr& expr,
+                                     const BindContext& context);
+
     void serializeTo(ASTSerializer& serializer) const;
 
     static bool isKind(AssertionExprKind kind) { return kind == AssertionExprKind::Clocking; }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        clocking.visit(visitor);
+        expr.visit(visitor);
+    }
 };
 
 struct StrongWeakPropertyExprSyntax;
@@ -298,12 +419,19 @@ public:
     StrongWeakAssertionExpr(const AssertionExpr& expr, Strength strength) :
         AssertionExpr(AssertionExprKind::StrongWeak), expr(expr), strength(strength) {}
 
+    bool admitsEmptyImpl() const { return false; }
+
     static AssertionExpr& fromSyntax(const StrongWeakPropertyExprSyntax& syntax,
                                      const BindContext& context);
 
     void serializeTo(ASTSerializer& serializer) const;
 
     static bool isKind(AssertionExprKind kind) { return kind == AssertionExprKind::StrongWeak; }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        expr.visit(visitor);
+    }
 };
 
 struct AcceptOnPropertyExprSyntax;
@@ -321,12 +449,20 @@ public:
         AssertionExpr(AssertionExprKind::Abort),
         condition(condition), expr(expr), action(action), isSync(isSync) {}
 
+    bool admitsEmptyImpl() const { return false; }
+
     static AssertionExpr& fromSyntax(const AcceptOnPropertyExprSyntax& syntax,
                                      const BindContext& context);
 
     void serializeTo(ASTSerializer& serializer) const;
 
     static bool isKind(AssertionExprKind kind) { return kind == AssertionExprKind::Abort; }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        condition.visit(visitor);
+        expr.visit(visitor);
+    }
 };
 
 struct ConditionalPropertyExprSyntax;
@@ -343,12 +479,22 @@ public:
         AssertionExpr(AssertionExprKind::Conditional),
         condition(condition), ifExpr(ifExpr), elseExpr(elseExpr) {}
 
+    bool admitsEmptyImpl() const { return false; }
+
     static AssertionExpr& fromSyntax(const ConditionalPropertyExprSyntax& syntax,
                                      const BindContext& context);
 
     void serializeTo(ASTSerializer& serializer) const;
 
     static bool isKind(AssertionExprKind kind) { return kind == AssertionExprKind::Conditional; }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        condition.visit(visitor);
+        ifExpr.visit(visitor);
+        if (elseExpr)
+            elseExpr->visit(visitor);
+    }
 };
 
 struct CasePropertyExprSyntax;
@@ -370,12 +516,54 @@ public:
         AssertionExpr(AssertionExprKind::Case),
         expr(expr), items(items), defaultCase(defaultCase) {}
 
+    bool admitsEmptyImpl() const { return false; }
+
     static AssertionExpr& fromSyntax(const CasePropertyExprSyntax& syntax,
                                      const BindContext& context);
 
     void serializeTo(ASTSerializer& serializer) const;
 
     static bool isKind(AssertionExprKind kind) { return kind == AssertionExprKind::Case; }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        expr.visit(visitor);
+        for (auto& item : items) {
+            for (auto e : item.expressions)
+                e->visit(visitor);
+            item.body->visit(visitor);
+        }
+
+        if (defaultCase)
+            defaultCase->visit(visitor);
+    }
+};
+
+struct DisableIffSyntax;
+
+/// Represents a disable iff condition in a property spec.
+class DisableIffAssertionExpr : public AssertionExpr {
+public:
+    const Expression& condition;
+    const AssertionExpr& expr;
+
+    DisableIffAssertionExpr(const Expression& condition, const AssertionExpr& expr) :
+        AssertionExpr(AssertionExprKind::DisableIff), condition(condition), expr(expr) {}
+
+    bool admitsEmptyImpl() const { return false; }
+
+    static AssertionExpr& fromSyntax(const DisableIffSyntax& syntax, const AssertionExpr& expr,
+                                     const BindContext& context);
+
+    void serializeTo(ASTSerializer& serializer) const;
+
+    static bool isKind(AssertionExprKind kind) { return kind == AssertionExprKind::DisableIff; }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        condition.visit(visitor);
+        expr.visit(visitor);
+    }
 };
 
 } // namespace slang

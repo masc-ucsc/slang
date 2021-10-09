@@ -138,10 +138,19 @@ public:
     /// fixed size, dynamic, associative, or a queue.
     bool isUnpackedArray() const;
 
+    /// Indicates whether this is a dynamic array, associative array, or a queue.
+    bool isDynamicallySizedArray() const;
+
+    /// Indicates whether this is a tagged union, packed or unpacked.
+    bool isTaggedUnion() const;
+
     /// Indicates whether this is an unpacked structure type.
     bool isUnpackedStruct() const {
         return getCanonicalType().kind == SymbolKind::UnpackedStructType;
     }
+
+    /// Indicates whether this is a packed union type.
+    bool isPackedUnion() const { return getCanonicalType().kind == SymbolKind::PackedUnionType; }
 
     /// Indicates whether this is an unpacked union type.
     bool isUnpackedUnion() const {
@@ -290,19 +299,17 @@ public:
     static const Type* getCommonBase(const Type& left, const Type& right);
 
     static const Type& fromSyntax(Compilation& compilation, const DataTypeSyntax& syntax,
-                                  LookupLocation location, const Scope& scope,
-                                  const Type* typedefTarget);
+                                  const BindContext& context, const Type* typedefTarget);
 
     static const Type& fromSyntax(Compilation& compilation, const Type& elementType,
                                   const SyntaxList<VariableDimensionSyntax>& dimensions,
-                                  LookupLocation location, const Scope& scope);
+                                  const BindContext& context);
 
     /// Constructs a type from the results of a lookup operation. Note that this will
     /// not issue any diagnostics from the result object; the caller must do that
     /// themselves if they wish.
     static const Type& fromLookupResult(Compilation& compilation, const LookupResult& result,
-                                        const NameSyntax& syntax, LookupLocation location,
-                                        const Scope& parent);
+                                        const NameSyntax& syntax, const BindContext& context);
 
     static bool isKind(SymbolKind kind);
 
@@ -318,8 +325,7 @@ private:
     void resolveCanonical() const;
 
     static const Type& lookupNamedType(Compilation& compilation, const NameSyntax& syntax,
-                                       LookupLocation location, const Scope& parent,
-                                       bool isTypedefTarget);
+                                       const BindContext& context, bool isTypedefTarget);
 };
 
 Diagnostic& operator<<(Diagnostic& diag, const Type& arg);

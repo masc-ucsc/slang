@@ -64,6 +64,8 @@ public:
     void visit(const EventTriggerStatement&) {}
     void visit(const ProceduralAssignStatement&) {}
     void visit(const ProceduralDeassignStatement&) {}
+    void visit(const RandCaseStatement&) {}
+    void visit(const RandSequenceStatement&) {}
 
     MIRValue visit(const IntegerLiteral& expr) { return emitConst(expr); }
     MIRValue visit(const RealLiteral& expr) { return emitConst(expr); }
@@ -165,8 +167,9 @@ public:
     MIRValue visit(const EmptyArgumentExpression&) { return {}; }
     MIRValue visit(const OpenRangeExpression&) { return {}; }
     MIRValue visit(const DistExpression&) { return {}; }
-    MIRValue visit(const ClockingArgumentExpression&) { return {}; }
+    MIRValue visit(const ClockingEventExpression&) { return {}; }
     MIRValue visit(const AssertionInstanceExpression&) { return {}; }
+    MIRValue visit(const TaggedUnionExpression&) { return {}; }
 
     void visitInvalid(const Statement&) {}
     MIRValue visitInvalid(const Expression&) { return {}; }

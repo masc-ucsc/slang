@@ -238,3 +238,87 @@ TEST_CASE("Conditional matching expression") {
     CHECK(stmt.toString() == text);
     CHECK_DIAGNOSTICS_EMPTY;
 }
+
+TEST_CASE("Checker statement parsing") {
+    auto& text = R"(
+checker c1(event clk, logic[7:0] a, b);
+  logic [7:0] sum;
+  always_ff @(clk) begin
+    sum <= a + 1'b1;
+    p0: assert property (sum < 12);
+  end
+  p1: assert property (@clk sum < 12);
+  p2: assert property (@clk a != b);
+  p3: assert #0 ($onehot(a));
+endchecker
+
+module m(input logic rst, clk, logic en, logic[7:0] in1, in2,
+         in_array [20:0]);
+  c1 check_outside(posedge clk, in1, in2);
+  always @(posedge clk) begin
+    automatic logic [7:0] v1=0;
+    if (en) begin
+      // v1 is automatic, so current procedural value is used
+      c1 check_inside(posedge clk, in1, v1);
+    end
+
+    for (int i = 0; i < 4; i++) begin
+      v1 = v1+5;
+      if (i != 2) begin
+        // v1 is automatic, so current procedural value is used
+        c1 check_loop(posedge clk, in1, in_array[v1]);
+      end
+     end
+  end
+endmodule : m
+)";
+    parseCompilationUnit(text);
+    CHECK_DIAGNOSTICS_EMPTY;
+}
+
+TEST_CASE("randsequence parsing") {
+    auto& text = R"(
+module rand_sequence1(); 
+  initial begin 
+  
+	randsequence( bin_op )
+		void bin_op : value operator value // void type is optional
+		{ $display("%s %b %b", operator, value[1], value[2]); }
+		;
+		bit [7:0] value : { return $urandom; } ;
+		string operator : add := 5 { return "+" ; }
+						  | dec := 2 { return "-" ; }
+						  | mult := 1 { return "*" ; }
+						  ;
+	endsequence
+  end
+endmodule
+)";
+    parseCompilationUnit(text);
+    CHECK_DIAGNOSTICS_EMPTY;
+}
+
+TEST_CASE("randsequence parsing error cases") {
+    auto& text = R"(
+module rand_sequence1(); 
+  initial begin
+    randsequence()
+        foo: case(x) default: a; default: b; endcase;
+        baz: rand join;
+        baz: rand join a;
+        bar: rand join a if (1) a else b;
+    endsequence
+
+	randsequence( bin_op )
+  end
+endmodule
+)";
+    parseCompilationUnit(text);
+
+    REQUIRE(diagnostics.size() == 5);
+    CHECK(diagnostics[0].code == diag::MultipleDefaultCases);
+    CHECK(diagnostics[1].code == diag::RandJoinNotEnough);
+    CHECK(diagnostics[2].code == diag::RandJoinNotEnough);
+    CHECK(diagnostics[3].code == diag::RandJoinProdItem);
+    CHECK(diagnostics[4].code == diag::ExpectedRsRule);
+}

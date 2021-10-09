@@ -186,10 +186,16 @@ const Expression& Expression::bindLValue(const ExpressionSyntax& lhs, const Type
     if (rhsExpr->bad())
         return badExpr(comp, nullptr);
 
-    Expression* lhsExpr = (lhs.kind == SyntaxKind::StreamingConcatenationExpression && !isInout &&
-                           !(context.instance && !context.instance->arrayPath.empty()))
-                              ? &selfDetermined(comp, lhs, context, BindFlags::StreamingAllowed)
-                              : &create(comp, lhs, context, BindFlags::None, rhsExpr->type);
+    Expression* lhsExpr;
+    if (lhs.kind == SyntaxKind::StreamingConcatenationExpression && !isInout &&
+        !context.isPortConnection()) {
+        lhsExpr =
+            &selfDetermined(comp, lhs, context, BindFlags::StreamingAllowed | BindFlags::LValue);
+    }
+    else {
+        lhsExpr = &create(comp, lhs, context, BindFlags::LValue, rhsExpr->type);
+    }
+
     selfDetermined(context, lhsExpr);
 
     SourceRange lhsRange = lhs.sourceRange();
@@ -201,21 +207,23 @@ const Expression& Expression::bindLValue(const ExpressionSyntax& lhs, const Type
 }
 
 const Expression& Expression::bindRValue(const Type& lhs, const ExpressionSyntax& rhs,
-                                         SourceLocation location, const BindContext& context) {
+                                         SourceLocation location, const BindContext& context,
+                                         bitmask<BindFlags> extraFlags) {
     Compilation& comp = context.getCompilation();
 
+    BindContext ctx = context.resetFlags(extraFlags);
     if (lhs.isVirtualInterface()) {
-        if (auto ref = tryBindInterfaceRef(context, rhs, lhs))
-            return checkBindFlags(*ref, context);
+        if (auto ref = tryBindInterfaceRef(ctx, rhs, lhs))
+            return checkBindFlags(*ref, ctx);
     }
 
-    bitmask<BindFlags> extraFlags = context.instance && !context.instance->arrayPath.empty()
-                                        ? BindFlags::None
-                                        : BindFlags::StreamingAllowed;
-    Expression& expr = create(comp, rhs, context, extraFlags, &lhs);
+    if (!ctx.isPortConnection())
+        extraFlags |= BindFlags::StreamingAllowed;
 
-    const Expression& result = convertAssignment(context, lhs, expr, location);
-    return checkBindFlags(result, context);
+    Expression& expr = create(comp, rhs, ctx, extraFlags, &lhs);
+
+    const Expression& result = convertAssignment(ctx, lhs, expr, location);
+    return checkBindFlags(result, ctx);
 }
 
 const Expression& Expression::bindRefArg(const Type& lhs, bool isConstRef,
@@ -266,12 +274,12 @@ const Expression& Expression::bindArgument(const Type& argType, ArgumentDirectio
     THROW_UNREACHABLE;
 }
 
-const Expression& Expression::bindImplicitParam(const DataTypeSyntax& typeSyntax,
-                                                const ExpressionSyntax& rhs,
-                                                SourceLocation location,
-                                                const BindContext& context) {
-    Compilation& comp = context.getCompilation();
-    Expression& expr = create(comp, rhs, context);
+const Expression& Expression::bindImplicitParam(
+    const DataTypeSyntax& typeSyntax, const ExpressionSyntax& rhs, SourceLocation location,
+    const BindContext& exprContext, const BindContext& typeContext, bitmask<BindFlags> extraFlags) {
+
+    Compilation& comp = exprContext.getCompilation();
+    Expression& expr = create(comp, rhs, exprContext, extraFlags);
     const Type* lhsType = expr.type;
 
     // Rules are described in [6.20.2].
@@ -279,7 +287,7 @@ const Expression& Expression::bindImplicitParam(const DataTypeSyntax& typeSyntax
     if (!it.dimensions.empty()) {
         // If we have a range provided, the result is always an integral value
         // of the provided width -- getType() will do what we want here.
-        lhsType = &comp.getType(typeSyntax, context.getLocation(), *context.scope);
+        lhsType = &comp.getType(typeSyntax, typeContext);
     }
     else if (it.signing) {
         // If signing is provided, the result is always integral but we infer the width.
@@ -310,8 +318,8 @@ const Expression& Expression::bindImplicitParam(const DataTypeSyntax& typeSyntax
         }
     }
 
-    const Expression& result = convertAssignment(context, *lhsType, expr, location);
-    return checkBindFlags(result, context);
+    const Expression& result = convertAssignment(exprContext, *lhsType, expr, location);
+    return checkBindFlags(result, exprContext);
 }
 
 const Expression& Expression::checkBindFlags(const Expression& expr, const BindContext& context) {
@@ -405,7 +413,7 @@ bool Expression::verifyAssignable(const BindContext& context, SourceLocation loc
 }
 
 bool Expression::canConnectToRefArg(bool isConstRef, bool allowConstClassHandle) const {
-    auto sym = getSymbolReference();
+    auto sym = getSymbolReference(/* allowPacked */ false);
     if (!sym || !VariableSymbol::isKind(sym->kind))
         return false;
 
@@ -433,24 +441,28 @@ optional<bitwidth_t> Expression::getEffectiveWidth() const {
     return visit(visitor);
 }
 
-const Symbol* Expression::getSymbolReference() const {
+const Symbol* Expression::getSymbolReference(bool allowPacked) const {
     switch (kind) {
         case ExpressionKind::NamedValue:
         case ExpressionKind::HierarchicalValue:
             return &as<ValueExpressionBase>().symbol;
         case ExpressionKind::ElementSelect: {
             auto& val = as<ElementSelectExpression>().value();
-            return val.type->isUnpackedArray() ? val.getSymbolReference() : nullptr;
+            return (allowPacked || val.type->isUnpackedArray()) ? val.getSymbolReference()
+                                                                : nullptr;
         }
         case ExpressionKind::RangeSelect: {
             auto& val = as<RangeSelectExpression>().value();
-            return val.type->isUnpackedArray() ? val.getSymbolReference() : nullptr;
+            return (allowPacked || val.type->isUnpackedArray()) ? val.getSymbolReference()
+                                                                : nullptr;
         }
         case ExpressionKind::MemberAccess: {
             auto& access = as<MemberAccessExpression>();
             auto& val = access.value();
-            if (val.type->isClass() || val.type->isUnpackedStruct())
+            if (allowPacked || val.type->isClass() || val.type->isVirtualInterface() ||
+                val.type->isVoid() || val.type->isUnpackedStruct() || val.type->isUnpackedUnion()) {
                 return &access.member;
+            }
             return nullptr;
         }
         case ExpressionKind::HierarchicalReference:
@@ -731,8 +743,8 @@ Expression& Expression::create(Compilation& compilation, const ExpressionSyntax&
                 compilation, syntax.as<ArrayOrRandomizeMethodExpressionSyntax>(), context);
             break;
         case SyntaxKind::TaggedUnionExpression:
-            context.addDiag(diag::NotYetSupported, syntax.sourceRange());
-            result = &badExpr(compilation, nullptr);
+            result = &TaggedUnionExpression::fromSyntax(
+                compilation, syntax.as<TaggedUnionExpressionSyntax>(), context, assignmentTarget);
             break;
         default:
             if (NameSyntax::isKind(syntax.kind)) {
@@ -755,38 +767,53 @@ Expression& Expression::bindName(Compilation& compilation, const NameSyntax& syn
                                  const InvocationExpressionSyntax* invocation,
                                  const ArrayOrRandomizeMethodExpressionSyntax* withClause,
                                  const BindContext& context) {
-    // If we're in an array iterator expression, the iterator variable needs to be findable
-    // even though it's not added to any scope. Check for that case and manually look for
-    // its name here.
-    if (context.firstIterator) {
-        LookupResult result;
-        if (Lookup::findIterator(*context.scope, *context.firstIterator, syntax, result))
-            return bindLookupResult(compilation, result, syntax, invocation, withClause, context);
-    }
-
     bitmask<LookupFlags> flags = LookupFlags::RegisterUpwardNames;
     if (invocation && invocation->arguments)
         flags |= LookupFlags::AllowDeclaredAfter;
-    if ((context.flags & BindFlags::Constant) || (context.flags & BindFlags::NoHierarchicalNames))
+    if (context.flags.has(BindFlags::Constant) || context.flags.has(BindFlags::NoHierarchicalNames))
         flags |= LookupFlags::Constant;
 
-    if (context.classRandomizeScope) {
-        ASSERT(context.classRandomizeScope->classType);
-
-        // Inside a class-scoped randomize call, first do a lookup in the class scope.
-        // If it's not found, we proceed to do a normal lookup.
-        LookupResult result;
-        if (Lookup::withinClassRandomize(*context.classRandomizeScope->classType,
-                                         context.classRandomizeScope->nameRestrictions, syntax,
-                                         flags, result)) {
-            return bindLookupResult(compilation, result, syntax, invocation, withClause, context);
+    // Special case scenarios: array iterator expressions, class-scoped randomize calls,
+    // and expanding sequences and properties.
+    if (context.firstIterator || context.randomizeDetails || context.assertionInstance) {
+        // If we're in an array iterator expression, the iterator variable needs to be findable
+        // even though it's not added to any scope. Check for that case and manually look for
+        // its name here.
+        if (context.firstIterator) {
+            LookupResult result;
+            if (Lookup::findIterator(*context.scope, *context.firstIterator, syntax, result)) {
+                return bindLookupResult(compilation, result, syntax, invocation, withClause,
+                                        context);
+            }
         }
-        else if (result.hasError()) {
-            result.reportErrors(context);
-            return badExpr(compilation, nullptr);
+
+        if (context.randomizeDetails && context.randomizeDetails->classType) {
+            // Inside a class-scoped randomize call, first do a lookup in the class scope.
+            // If it's not found, we proceed to do a normal lookup.
+            LookupResult result;
+            if (Lookup::withinClassRandomize(*context.randomizeDetails->classType,
+                                             context.randomizeDetails->nameRestrictions, syntax,
+                                             flags, result)) {
+                return bindLookupResult(compilation, result, syntax, invocation, withClause,
+                                        context);
+            }
+            else if (result.hasError()) {
+                result.reportErrors(context);
+                return badExpr(compilation, nullptr);
+            }
+        }
+
+        if (context.assertionInstance) {
+            // Look for a matching local assertion variable.
+            LookupResult result;
+            if (Lookup::findAssertionLocalVar(context, syntax, result)) {
+                return bindLookupResult(compilation, result, syntax, invocation, withClause,
+                                        context);
+            }
         }
     }
 
+    // Normal name lookup and resolution.
     LookupResult result;
     Lookup::name(syntax, context, flags, result);
     result.reportErrors(context);
@@ -813,12 +840,32 @@ Expression& Expression::bindLookupResult(Compilation& compilation, const LookupR
     if (!symbol)
         return badExpr(compilation, nullptr);
 
-    if (symbol->isType() && context.flags.has(BindFlags::AllowDataType)) {
+    SourceRange sourceRange = syntax.sourceRange();
+    auto errorIfInvoke = [&]() {
+        // If we require a subroutine, enforce that now. The invocation syntax will have been
+        // nulled out if we used it elsewhere in this function.
+        if (invocation) {
+            SourceLocation loc = invocation->arguments ? invocation->arguments->openParen.location()
+                                                       : sourceRange.start();
+            auto& diag = context.addDiag(diag::ExpressionNotCallable, loc);
+            diag << sourceRange;
+            return false;
+        }
+        else if (withClause) {
+            context.addDiag(diag::UnexpectedWithClause, withClause->with.range());
+            return false;
+        }
+        return true;
+    };
+
+    if (context.flags.has(BindFlags::AllowDataType) && symbol->isType()) {
         // We looked up a named data type and we were allowed to do so, so return it.
-        ASSERT(!invocation && !withClause);
-        const Type& resultType = Type::fromLookupResult(compilation, result, syntax,
-                                                        context.getLocation(), *context.scope);
-        return *compilation.emplace<DataTypeExpression>(resultType, syntax.sourceRange());
+        const Type& resultType = Type::fromLookupResult(compilation, result, syntax, context);
+        auto expr = compilation.emplace<DataTypeExpression>(resultType, sourceRange);
+        if (!expr->bad() && !errorIfInvoke())
+            return badExpr(compilation, expr);
+
+        return *expr;
     }
 
     // Recursive function call
@@ -834,7 +881,6 @@ Expression& Expression::bindLookupResult(Compilation& compilation, const LookupR
     }
 
     Expression* expr;
-    SourceRange sourceRange = syntax.sourceRange();
     switch (symbol->kind) {
         case SymbolKind::Subroutine: {
             SourceRange callRange = invocation ? invocation->sourceRange() : sourceRange;
@@ -848,6 +894,16 @@ Expression& Expression::bindLookupResult(Compilation& compilation, const LookupR
         case SymbolKind::Property:
             expr =
                 &AssertionInstanceExpression::fromLookup(*symbol, invocation, sourceRange, context);
+            invocation = nullptr;
+            break;
+        case SymbolKind::LetDecl:
+            expr =
+                &AssertionInstanceExpression::fromLookup(*symbol, invocation, sourceRange, context);
+            if (result.isHierarchical) {
+                SourceRange callRange = invocation ? invocation->sourceRange() : sourceRange;
+                context.addDiag(diag::LetHierarchical, callRange);
+            }
+
             invocation = nullptr;
             break;
         case SymbolKind::AssertionPort:
@@ -889,18 +945,8 @@ Expression& Expression::bindLookupResult(Compilation& compilation, const LookupR
         }
     }
 
-    // If we require a subroutine, enforce that now. The invocation syntax will have been
-    // nulled out if we used it above.
-    if (invocation && !expr->bad()) {
-        SourceLocation loc = invocation->arguments ? invocation->arguments->openParen.location()
-                                                   : sourceRange.start();
-        auto& diag = context.addDiag(diag::ExpressionNotCallable, loc);
-        diag << sourceRange;
-        return badExpr(compilation, nullptr);
-    }
-    else if (withClause && !expr->bad()) {
-        context.addDiag(diag::UnexpectedWithClause, withClause->with.range());
-    }
+    if (!expr->bad() && !errorIfInvoke())
+        return badExpr(compilation, expr);
 
     return *expr;
 }
@@ -1004,8 +1050,7 @@ Expression* Expression::tryBindInterfaceRef(const BindContext& context,
                                                                              syntax.sourceRange());
 }
 
-void Expression::findPotentiallyImplicitNets(const ExpressionSyntax& expr,
-                                             const BindContext& context,
+void Expression::findPotentiallyImplicitNets(const SyntaxNode& expr, const BindContext& context,
                                              SmallVector<Token>& results) {
     struct Visitor : public SyntaxVisitor<Visitor> {
         Visitor(const BindContext& context, SmallVector<Token>& results) :

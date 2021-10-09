@@ -10,18 +10,21 @@
 #include "slang/binding/EvalContext.h"
 #include "slang/binding/LValue.h"
 #include "slang/symbols/SemanticFacts.h"
+#include "slang/util/StackContainer.h"
 
 namespace slang {
 
 class ASTSerializer;
 class InstanceSymbolBase;
 class Type;
+struct ArgumentListSyntax;
 struct ArrayOrRandomizeMethodExpressionSyntax;
 struct AssignmentPatternExpressionSyntax;
 struct DataTypeSyntax;
 struct ElementSelectExpressionSyntax;
 struct ExpressionSyntax;
 struct InvocationExpressionSyntax;
+struct NamedArgumentSyntax;
 
 // clang-format off
 #define EXPRESSION(x) \
@@ -62,8 +65,9 @@ struct InvocationExpressionSyntax;
     x(NewClass) \
     x(CopyClass) \
     x(MinTypMax) \
-    x(ClockingArgument) \
-    x(AssertionInstance)
+    x(ClockingEvent) \
+    x(AssertionInstance) \
+    x(TaggedUnion)
 ENUM(ExpressionKind, EXPRESSION);
 #undef EXPRESSION
 
@@ -154,7 +158,8 @@ public:
 
     /// Binds the right hand side of an assignment-like expression from the given syntax nodes.
     static const Expression& bindRValue(const Type& lhs, const ExpressionSyntax& rhs,
-                                        SourceLocation location, const BindContext& context);
+                                        SourceLocation location, const BindContext& context,
+                                        bitmask<BindFlags> extraFlags = BindFlags::None);
 
     /// Binds a connection to a ref argument from the given syntax nodes.
     static const Expression& bindRefArg(const Type& lhs, bool isConstRef,
@@ -170,7 +175,9 @@ public:
     /// There are special inference rules for parameters.
     static const Expression& bindImplicitParam(const DataTypeSyntax& implicitType,
                                                const ExpressionSyntax& rhs, SourceLocation location,
-                                               const BindContext& context);
+                                               const BindContext& exprContext,
+                                               const BindContext& typeContext,
+                                               bitmask<BindFlags> extraFlags = BindFlags::None);
 
     /// Converts the given expression to the specified type, as if the right hand side had been
     /// assigned (without a cast) to a left hand side of the specified type.
@@ -187,12 +194,15 @@ public:
     ///
     /// The @param keyword parameter is used to customize diagnostics produced.
     ///
-    /// If @param wildcard is set to true, expression types will be restricted to
+    /// If @param requireIntegral is set to true, expression types will be restricted to
     /// be only integral types.
     ///
     /// If @param unwrapUnpacked is set to true, unpacked arrays will be unwrapped to
     /// their element types to find the type to check against. Otherwise, all aggregates
     /// are illegal.
+    ///
+    /// If @param allowOpenRange is set to true, open range expressions will be allowed.
+    /// Otherwise an error will be issued for them.
     ///
     /// If @param allowTypeReferences is true the bound expressions are allowed to
     /// be type reference expressions. Otherwise an error will be issued.
@@ -200,8 +210,8 @@ public:
     /// @returns true if all expressions are legal, otherwise false and appropriate
     /// diagnostics are issued.
     static bool bindMembershipExpressions(const BindContext& context, TokenKind keyword,
-                                          bool wildcard, bool unwrapUnpacked,
-                                          bool allowTypeReferences,
+                                          bool requireIntegral, bool unwrapUnpacked,
+                                          bool allowTypeReferences, bool allowOpenRange,
                                           const ExpressionSyntax& valueExpr,
                                           span<const ExpressionSyntax* const> expressions,
                                           SmallVector<const Expression*>& results);
@@ -209,8 +219,7 @@ public:
     /// This method finds all unqualified name references in the given expression and attempts
     /// to look them up in the given context. If they can't be found, their name tokens are
     /// returned in the given @a results vector.
-    static void findPotentiallyImplicitNets(const ExpressionSyntax& expr,
-                                            const BindContext& context,
+    static void findPotentiallyImplicitNets(const SyntaxNode& expr, const BindContext& context,
                                             SmallVector<Token>& results);
 
     /// Indicates whether the expression is invalid.
@@ -256,11 +265,12 @@ public:
     optional<bitwidth_t> getEffectiveWidth() const;
 
     /// If this expression is a reference to a symbol, returns a pointer to that symbol.
-    /// Otherwise, returns null. If the expression is a member access of an unpacked struct
-    /// or class, returns the member being accessed. If it's an element select of an unpacked
-    /// array, returns the root array variable. Selects of a packed types are not considered
-    /// symbol references.
-    const Symbol* getSymbolReference() const;
+    /// Otherwise, returns null. If the expression is a member access of a struct
+    /// or class, returns the member being accessed. If it's a select of an array, returns
+    /// the root array variable. The @a allowPacked argument determines whether selects
+    /// of a packed type are considered a symbol reference or whether to consider only
+    /// unpacked structs and arrays.
+    const Symbol* getSymbolReference(bool allowPacked = true) const;
 
     template<typename T>
     T& as() {
@@ -343,6 +353,10 @@ protected:
 
     template<typename TExpression, typename TVisitor, typename... Args>
     decltype(auto) visitExpression(TExpression* expr, TVisitor&& visitor, Args&&... args) const;
+
+    using NamedArgMap = SmallMap<string_view, std::pair<const NamedArgumentSyntax*, bool>, 8>;
+    static bool collectArgs(const BindContext& context, const ArgumentListSyntax& syntax,
+                            SmallVector<const SyntaxNode*>& orderedArgs, NamedArgMap& namedArgs);
 };
 
 /// Represents an invalid expression, which is usually generated and inserted

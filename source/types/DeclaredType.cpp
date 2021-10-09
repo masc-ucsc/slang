@@ -9,6 +9,7 @@
 #include "slang/binding/Expression.h"
 #include "slang/compilation/Compilation.h"
 #include "slang/diagnostics/DeclarationsDiags.h"
+#include "slang/diagnostics/StatementsDiags.h"
 #include "slang/symbols/ClassSymbols.h"
 #include "slang/symbols/Scope.h"
 #include "slang/symbols/SubroutineSymbols.h"
@@ -29,7 +30,7 @@ DeclaredType::DeclaredType(const Symbol& parent, bitmask<DeclaredTypeFlags> flag
 
 const Type& DeclaredType::getType() const {
     if (!type)
-        resolveType(getBindContext<true>());
+        resolveType(getBindContext<false>(), getBindContext<true>());
     return *type;
 }
 
@@ -62,9 +63,9 @@ const Scope& DeclaredType::getScope() const {
     return *scope;
 }
 
-void DeclaredType::resolveType(const BindContext& initializerContext) const {
-    auto& scope = getScope();
-    auto& comp = scope.getCompilation();
+void DeclaredType::resolveType(const BindContext& typeContext,
+                               const BindContext& initializerContext) const {
+    auto& comp = typeContext.getCompilation();
     if (!typeSyntax) {
         type = &comp.getErrorType();
         return;
@@ -77,17 +78,22 @@ void DeclaredType::resolveType(const BindContext& initializerContext) const {
     // If we are configured to infer implicit types, bind the initializer expression
     // first so that we can derive our type from whatever that happens to be.
     if (typeSyntax->kind == SyntaxKind::ImplicitType &&
-        (flags & DeclaredTypeFlags::InferImplicit) != 0) {
+        flags.has(DeclaredTypeFlags::InferImplicit)) {
         if (dimensions) {
-            scope.addDiag(diag::UnpackedArrayParamType, dimensions->sourceRange());
+            typeContext.addDiag(diag::UnpackedArrayParamType, dimensions->sourceRange());
             type = &comp.getErrorType();
         }
         else if (!initializerSyntax) {
             type = &comp.getErrorType();
         }
         else {
-            initializer = &Expression::bindImplicitParam(*typeSyntax, *initializerSyntax,
-                                                         initializerLocation, initializerContext);
+            bitmask<BindFlags> extraFlags;
+            if (flags.has(DeclaredTypeFlags::AllowUnboundedLiteral))
+                extraFlags = BindFlags::AllowUnboundedLiteral;
+
+            initializer =
+                &Expression::bindImplicitParam(*typeSyntax, *initializerSyntax, initializerLocation,
+                                               initializerContext, typeContext, extraFlags);
             type = initializer->type;
         }
     }
@@ -96,10 +102,9 @@ void DeclaredType::resolveType(const BindContext& initializerContext) const {
         if (flags.has(DeclaredTypeFlags::TypedefTarget))
             typedefTarget = &parent.as<Type>();
 
-        BindContext typeContext = getBindContext<false>();
-        type = &comp.getType(*typeSyntax, typeContext.getLocation(), scope, typedefTarget);
+        type = &comp.getType(*typeSyntax, typeContext, typedefTarget);
         if (dimensions)
-            type = &comp.getType(*type, *dimensions, typeContext.getLocation(), scope);
+            type = &comp.getType(*type, *dimensions, typeContext);
     }
 
     if (flags.has(DeclaredTypeFlags::NeedsTypeCheck) && !type->isError())
@@ -203,6 +208,10 @@ void DeclaredType::checkType(const BindContext& context) const {
         case uint32_t(DeclaredTypeFlags::DPIArg):
             if (!type->isValidForDPIArg())
                 context.addDiag(diag::InvalidDPIArgType, parent.location) << *type;
+            break;
+        case uint32_t(DeclaredTypeFlags::RequireSequenceType):
+            if (!type->isValidForSequence())
+                context.addDiag(diag::AssertionExprType, parent.location) << *type;
             break;
         default:
             THROW_UNREACHABLE;
@@ -336,28 +345,36 @@ void DeclaredType::mergePortTypes(
 }
 
 void DeclaredType::resolveAt(const BindContext& context) const {
-    if (!initializerSyntax)
-        return;
-
     if (!type) {
-        resolveType(context);
+        resolveType(getBindContext<false>(), context);
         if (initializer)
             return;
     }
+
+    if (!initializerSyntax)
+        return;
 
     // Enums are special in that their initializers target the base type of the enum
     // instead of the actual enum type (which doesn't allow implicit conversions from
     // normal integral values).
     auto& scope = *context.scope;
-    bitmask<BindFlags> bindFlags = context.flags;
+    bitmask<BindFlags> extraFlags;
     const Type* targetType = type;
     if (targetType->isEnum() && scope.asSymbol().kind == SymbolKind::EnumType) {
         targetType = &targetType->as<EnumType>().baseType;
-        bindFlags |= BindFlags::EnumInitializer;
+        extraFlags = BindFlags::EnumInitializer;
+    }
+    else if (flags.has(DeclaredTypeFlags::AllowUnboundedLiteral)) {
+        extraFlags = BindFlags::AllowUnboundedLiteral;
     }
 
     initializer = &Expression::bindRValue(*targetType, *initializerSyntax, initializerLocation,
-                                          context.resetFlags(bindFlags));
+                                          context, extraFlags);
+}
+
+void DeclaredType::forceResolveAt(const BindContext& context) const {
+    resolveType(context, context);
+    resolveAt(context);
 }
 
 const Expression* DeclaredType::getInitializer() const {
@@ -390,14 +407,21 @@ T DeclaredType::getBindContext() const {
     // The location depends on whether we are binding the initializer or the type.
     // Initializer lookup happens *after* the parent symbol, so that it can reference
     // the symbol itself. Type lookup happens *before*, since it can't yet see the
-    // symbol declaration.
+    // symbol declaration. There is an exception for parameters, which also can't
+    // see its own declaration (which would result in infinite recursion).
     LookupLocation location;
-    if (overrideIndex)
+    if (overrideIndex) {
         location = LookupLocation(parent.getParentScope(), overrideIndex);
-    else if (IsInitializer)
-        location = LookupLocation::after(parent);
-    else
+    }
+    else if (IsInitializer) {
+        if (flags.has(DeclaredTypeFlags::RequireConstant))
+            location = LookupLocation::before(parent);
+        else
+            location = LookupLocation::after(parent);
+    }
+    else {
         location = LookupLocation::before(parent);
+    }
 
     return BindContext(getScope(), location, bindFlags);
 }

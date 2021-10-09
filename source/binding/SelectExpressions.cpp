@@ -6,6 +6,7 @@
 //------------------------------------------------------------------------------
 #include "slang/binding/SelectExpressions.h"
 
+#include "slang/binding/CallExpression.h"
 #include "slang/binding/LiteralExpressions.h"
 #include "slang/binding/MiscExpressions.h"
 #include "slang/compilation/Compilation.h"
@@ -153,7 +154,10 @@ Expression& ElementSelectExpression::fromSyntax(Compilation& compilation, Expres
     }
 
     if (!selector) {
-        BindFlags flags = valueType.isQueue() ? BindFlags::AllowUnboundedLiteral : BindFlags::None;
+        bitmask<BindFlags> flags;
+        if (valueType.isQueue())
+            flags = BindFlags::AllowUnboundedLiteral | BindFlags::AllowUnboundedLiteralArithmetic;
+
         selector = &selfDetermined(compilation, syntax, context, flags);
         if (!selector->bad() && !selector->type->isIntegral() && !selector->type->isUnbounded()) {
             context.addDiag(diag::ExprMustBeIntegral, selector->sourceRange) << *selector->type;
@@ -369,7 +373,9 @@ Expression& RangeSelectExpression::fromSyntax(Compilation& compilation, Expressi
     bool isQueue = value.type->isQueue();
     bool leftConst = !isQueue && selectionKind == RangeSelectionKind::Simple;
     bool rightConst = !isQueue;
-    BindFlags extraFlags = isQueue ? BindFlags::AllowUnboundedLiteral : BindFlags::None;
+    bitmask<BindFlags> extraFlags;
+    if (isQueue)
+        extraFlags = BindFlags::AllowUnboundedLiteral | BindFlags::AllowUnboundedLiteralArithmetic;
 
     auto& left = leftConst ? bind(*syntax.left, context, BindFlags::Constant | extraFlags)
                            : selfDetermined(compilation, *syntax.left, context, extraFlags);
@@ -511,6 +517,7 @@ Expression& RangeSelectExpression::fromSyntax(Compilation& compilation, Expressi
             selectionRange = { *lv, *rv };
             if (selectionRange.isLittleEndian() && selectionRange.width() > 1) {
                 auto& diag = context.addDiag(diag::SelectEndianDynamic, errorRange);
+                diag << selectionRange.left << selectionRange.right;
                 diag << valueType;
                 return badExpr(compilation, result);
             }
@@ -823,6 +830,7 @@ Expression& MemberAccessExpression::fromSelector(
         case SymbolKind::AssociativeArrayType:
         case SymbolKind::QueueType:
         case SymbolKind::EventType:
+        case SymbolKind::SequenceType:
             return CallExpression::fromSystemMethod(compilation, expr, selector, invocation,
                                                     withClause, context);
         case SymbolKind::VirtualInterfaceType: {
@@ -835,6 +843,18 @@ Expression& MemberAccessExpression::fromSelector(
             else
                 scope = &vi.iface;
             break;
+        }
+        case SymbolKind::VoidType: {
+            // This is possible via a clocking block accessed through a virtual interface,
+            // so check for that case.
+            if (expr.kind == ExpressionKind::MemberAccess) {
+                auto sym = expr.getSymbolReference();
+                if (sym && sym->kind == SymbolKind::ClockingBlock) {
+                    scope = &sym->as<ClockingBlockSymbol>();
+                    break;
+                }
+            }
+            [[fallthrough]];
         }
         default: {
             if (auto result = tryBindSpecialMethod(compilation, expr, selector, invocation,
@@ -893,11 +913,13 @@ Expression& MemberAccessExpression::fromSelector(
                                               range, context);
         }
         case SymbolKind::ConstraintBlock:
+        case SymbolKind::ClockingBlock: {
             if (errorIfNotProcedural())
                 return badExpr(compilation, &expr);
             return *compilation.emplace<MemberAccessExpression>(compilation.getVoidType(), expr,
                                                                 *member, 0u, range);
-        default:
+        }
+        default: {
             if (member->isValue()) {
                 auto& value = member->as<ValueSymbol>();
                 return *compilation.emplace<MemberAccessExpression>(value.getType(), expr, value,
@@ -910,6 +932,7 @@ Expression& MemberAccessExpression::fromSelector(
             diag << selector.name;
             diag << *expr.type;
             return badExpr(compilation, &expr);
+        }
     }
 }
 
@@ -943,18 +966,186 @@ Expression& MemberAccessExpression::fromSyntax(
     return result;
 }
 
+// This iterator is used when translating values between different union members.
+// It walks recursively down through unpacked struct members and allows retrieving
+// corresponding constant values in member order, as long as they are equivalent
+// with the next expected type.
+class RecursiveStructMemberIterator {
+public:
+    RecursiveStructMemberIterator(const ConstantValue& startVal, const Type& startType) {
+        curr.val = &startVal;
+        curr.type = &startType;
+
+        if (curr.type->isUnpackedStruct()) {
+            auto range =
+                curr.type->getCanonicalType().as<UnpackedStructType>().membersOfType<FieldSymbol>();
+            curr.fieldIt = range.begin();
+            curr.fieldEnd = range.end();
+            prepNext();
+        }
+    }
+
+    const ConstantValue* tryConsume(const Type& targetType) {
+        if (!curr.type)
+            return nullptr;
+
+        if (!curr.type->isUnpackedStruct()) {
+            if (!curr.type->isEquivalent(targetType))
+                return nullptr;
+
+            curr.type = nullptr;
+            return curr.val;
+        }
+
+        if (!curr.fieldIt->getType().isEquivalent(targetType))
+            return nullptr;
+
+        auto result = &curr.val->at(curr.valIndex);
+        curr.next();
+        prepNext();
+        return result;
+    }
+
+private:
+    void prepNext() {
+        if (curr.fieldIt == curr.fieldEnd) {
+            if (stack.empty()) {
+                curr.type = nullptr;
+                return;
+            }
+
+            curr = stack.back();
+            stack.pop();
+
+            curr.next();
+            prepNext();
+        }
+        else {
+            auto& type = curr.fieldIt->getType();
+            if (type.isUnpackedStruct()) {
+                stack.emplace(curr);
+
+                auto range =
+                    type.getCanonicalType().as<UnpackedStructType>().membersOfType<FieldSymbol>();
+                curr.type = &type;
+                curr.val = &curr.val->at(curr.valIndex);
+                curr.fieldIt = range.begin();
+                curr.fieldEnd = range.end();
+                curr.valIndex = 0;
+                prepNext();
+            }
+        }
+    }
+
+    using FieldIt = Scope::specific_symbol_iterator<FieldSymbol>;
+
+    struct State {
+        const ConstantValue* val = nullptr;
+        const Type* type = nullptr;
+        size_t valIndex = 0;
+        FieldIt fieldIt;
+        FieldIt fieldEnd;
+
+        void next() {
+            fieldIt++;
+            valIndex++;
+        }
+    };
+
+    State curr;
+    SmallVectorSized<State, 4> stack;
+};
+
+static bool translateUnionMembers(ConstantValue& result, const Type& targetType,
+                                  RecursiveStructMemberIterator& rsmi) {
+    // If the target type is still an unpacked struct then recurse deeper until we
+    // reach a non-struct member that can be assigned a value.
+    if (targetType.isUnpackedStruct()) {
+        size_t i = 0;
+        for (auto& member : targetType.as<UnpackedStructType>().membersOfType<FieldSymbol>()) {
+            if (!translateUnionMembers(result.at(i++), member.getType().getCanonicalType(), rsmi)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    auto val = rsmi.tryConsume(targetType);
+    if (val) {
+        result = *val;
+        return true;
+    }
+
+    return false;
+}
+
+static bool checkPackedUnionTag(const Type& valueType, const SVInt& val, uint32_t expectedTag,
+                                EvalContext& context, SourceRange sourceRange,
+                                string_view memberName) {
+    uint32_t tagBits = valueType.as<PackedUnionType>().tagBits;
+    if (tagBits) {
+        bitwidth_t bits = val.getBitWidth();
+        auto tag = val.slice(int32_t(bits - 1), int32_t(bits - tagBits)).as<uint32_t>();
+        if (tag.value() != expectedTag) {
+            context.addDiag(diag::ConstEvalTaggedUnion, sourceRange) << memberName;
+            return false;
+        }
+    }
+
+    return true;
+}
+
 ConstantValue MemberAccessExpression::evalImpl(EvalContext& context) const {
     ConstantValue cv = value().eval(context);
     if (!cv)
         return nullptr;
 
-    // TODO: handle unpacked unions
-    if (value().type->isUnpackedStruct())
+    auto& valueType = value().type->getCanonicalType();
+    if (valueType.isUnpackedStruct()) {
         return cv.elements()[offset];
+    }
+    else if (valueType.isUnpackedUnion()) {
+        auto& unionVal = cv.unionVal();
+        if (unionVal->activeMember == offset)
+            return unionVal->value;
 
-    int32_t io = (int32_t)offset;
-    int32_t width = (int32_t)type->getBitWidth();
-    return cv.integer().slice(width + io - 1, io);
+        if (valueType.isTaggedUnion()) {
+            // Tagged unions can only be accessed via their active member.
+            context.addDiag(diag::ConstEvalTaggedUnion, sourceRange) << member.name;
+            return nullptr;
+        }
+        else {
+            // This member isn't active, so in general it's not safe (or even
+            // possible) to access it. An exception is made for the common initial
+            // sequence of equivalent types, so check for that here and if found
+            // translate the values across.
+            ConstantValue result = type->getDefaultValue();
+            if (unionVal->activeMember) {
+                // Get the type of the member that is currently active.
+                auto& currType = valueType.as<UnpackedUnionType>()
+                                     .memberAt<FieldSymbol>(*unionVal->activeMember)
+                                     .getType()
+                                     .getCanonicalType();
+
+                RecursiveStructMemberIterator rsmi(unionVal->value, currType);
+                translateUnionMembers(result, type->getCanonicalType(), rsmi);
+            }
+            return result;
+        }
+    }
+    else if (valueType.isPackedUnion()) {
+        auto& cvi = cv.integer();
+        if (!checkPackedUnionTag(valueType, cvi, offset, context, sourceRange, member.name)) {
+            return nullptr;
+        }
+
+        return cvi.slice(int32_t(type->getBitWidth() - 1), 0);
+    }
+    else {
+        int32_t io = (int32_t)offset;
+        int32_t width = (int32_t)type->getBitWidth();
+        return cv.integer().slice(width + io - 1, io);
+    }
 }
 
 LValue MemberAccessExpression::evalLValueImpl(EvalContext& context) const {
@@ -962,10 +1153,32 @@ LValue MemberAccessExpression::evalLValueImpl(EvalContext& context) const {
     if (!lval)
         return nullptr;
 
-    // TODO: handle unpacked unions
     int32_t io = (int32_t)offset;
-    if (value().type->isUnpackedStruct()) {
+    auto& valueType = value().type->getCanonicalType();
+    if (valueType.isUnpackedStruct()) {
         lval.addIndex(io, nullptr);
+    }
+    else if (valueType.isUnpackedUnion()) {
+        if (valueType.isTaggedUnion()) {
+            auto target = lval.resolve();
+            ASSERT(target);
+
+            if (target->unionVal()->activeMember != offset) {
+                context.addDiag(diag::ConstEvalTaggedUnion, sourceRange) << member.name;
+                return nullptr;
+            }
+        }
+        lval.addIndex(io, type->getDefaultValue());
+    }
+    else if (valueType.isPackedUnion()) {
+        auto cv = lval.load();
+        if (!checkPackedUnionTag(valueType, cv.integer(), offset, context, sourceRange,
+                                 member.name)) {
+            return nullptr;
+        }
+
+        int32_t width = (int32_t)type->getBitWidth();
+        lval.addBitSlice({ width - 1, 0 });
     }
     else {
         int32_t width = (int32_t)type->getBitWidth();
@@ -985,7 +1198,7 @@ bool MemberAccessExpression::verifyAssignableImpl(const BindContext& context,
     // If this is a selection of a class member, assignability depends only on the selected
     // member and not on the class handle itself. Otherwise, the opposite is true.
     auto& valueType = *value().type;
-    if (!valueType.isClass() && !valueType.isVirtualInterface())
+    if (!valueType.isClass() && !valueType.isVirtualInterface() && !valueType.isVoid())
         return value().verifyAssignable(context, location, isNonBlocking, inConcat);
 
     if (VariableSymbol::isKind(member.kind)) {

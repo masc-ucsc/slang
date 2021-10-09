@@ -49,6 +49,27 @@ endmodule
     NO_COMPILATION_ERRORS;
 }
 
+TEST_CASE("Foreach loop iterator regression #410") {
+    auto tree = SyntaxTree::fromText(R"(
+module m #(
+    int  N,
+    int	 VEC[N]
+)();
+    always_comb begin
+        foreach(VEC[i]) begin
+            automatic int v = VEC[i];
+            
+            $display(i);
+        end
+    end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
 TEST_CASE("Foreach loop errors") {
     auto tree = SyntaxTree::fromText(R"(
 module m;
@@ -332,19 +353,20 @@ endmodule
 TEST_CASE("Assertion statements") {
     auto tree = SyntaxTree::fromText(R"(
 module m;
-
     int i;
     logic foo [3];
 
     initial begin
         assert (i > 0) i++; else i--;
-        assume #0 (i < 0) else i--;
-        cover final (i) i++;
+        assume #0 (i < 0) else bar();
+        assume #0 (i < 0);
+        cover final (i) bar();
 
         assert (foo);                      // not boolean
         cover (i) else $fatal(1, "SDF");   // fail stmt not allowed
     end
 
+    function void bar(); endfunction
 endmodule
 )");
 
@@ -382,6 +404,38 @@ endmodule
     auto& diags = compilation.getAllDiagnostics();
     REQUIRE(diags.size() == 1);
     CHECK(diags[0].code == diag::ConstEvalAssertionFailed);
+}
+
+TEST_CASE("Deferred assertion error cases") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    function void f1; endfunction
+    function void f2(int i, output int o); endfunction
+    function automatic void f3(int i, ref r); endfunction
+
+    int i;
+    string s;
+    initial begin
+        automatic logic r;
+        assume #0 (i < 0) i++; else f1();
+        assert #0 (i < 0) void'($bits(i));
+        assert #0 (i < 0) f2(i, i);
+        assert #0 (i < 0) f3(i, r);
+        assert #0 (i < 0) $swrite(s, "%d", i);
+    end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 5);
+    CHECK(diags[0].code == diag::InvalidDeferredAssertAction);
+    CHECK(diags[1].code == diag::DeferredAssertSysTask);
+    CHECK(diags[2].code == diag::DeferredAssertOutArg);
+    CHECK(diags[3].code == diag::DeferredAssertAutoRefArg);
+    CHECK(diags[4].code == diag::DeferredAssertOutArg);
 }
 
 TEST_CASE("Break statement check -- regression") {
@@ -908,30 +962,6 @@ endmodule
     NO_COMPILATION_ERRORS;
 }
 
-TEST_CASE("Unsupported statement gracefully finish") {
-    auto tree = SyntaxTree::fromText(R"(
-module rand_sequence1();
-    initial begin
-        randsequence( bin_op )
-            void bin_op : value operator value // void type is optional
-            { $display("%s %b %b", operator, value[1], value[2]); }
-            ;
-            bit [7:0] value : { return $urandom; } ;
-            string operator : add := 5 { return "+" ; }
-            | dec := 2 { return "-" ; }
-            | mult := 1 { return "*" ; }
-            ;
-        endsequence
-    end
-endmodule
-)");
-
-    Compilation compilation;
-    compilation.addSyntaxTree(tree);
-    auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() > 0);
-}
-
 TEST_CASE("System functions that can also be tasks") {
     auto tree = SyntaxTree::fromText(R"(
 module m;
@@ -951,9 +981,11 @@ TEST_CASE("Event triggering statements") {
     auto tree = SyntaxTree::fromText(R"(
 module m;
     event e;
+    event arr[3];
     initial begin
         -> e;
         ->> #3 e;
+        -> arr[1];
     end
 endmodule
 )");
@@ -1120,6 +1152,10 @@ function f;
     wait (3) i = 1;
     wait_order(a, b, c);
     t();
+endfunction
+
+function g;
+    int i;
     begin
         static int j = i;
         t();
@@ -1281,4 +1317,167 @@ endmodule
     CHECK(diags[3].code == diag::CycleDelayNonClock);
     CHECK(diags[4].code == diag::ClockVarAssignConcat);
     CHECK(diags[5].code == diag::ClockVarSyncDrive);
+}
+
+TEST_CASE("Invalid case statement regress GH #422") {
+    auto tree = SyntaxTree::fromText(R"(
+initial casez       matches
+       a
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    // Just check no assertion.
+    compilation.getAllDiagnostics();
+}
+
+TEST_CASE("randcase statements") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    int foo[];
+    initial begin
+        byte a, b, x;
+        randcase 
+            a + b : x = 1;
+            a - b : x = 2;
+            a ^ ~b : x = 3;
+            12'h800 : x = 4;
+            foo : x = 5;
+        endcase
+    end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 1);
+    CHECK(diags[0].code == diag::ExprMustBeIntegral);
+}
+
+TEST_CASE("randsequence statements") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    int a;
+    int cnt;
+
+    initial begin
+        randsequence (main)
+            main : first second done ;
+            first : add("foo") | dec ;
+            second : pop | push ;
+            done : { $display("done"); return; } ;
+            add(string s) : { $display(s); } ;
+            dec : { $display("dec"); break; } ;
+            pop : repeat($urandom_range( 2, 6 )) push;
+            push : if (1) done else pop | rand join (0.5) first second done;
+            baz : case (a & 7) 1, 2: push; 3: pop; default done; endcase;
+        endsequence
+
+        randsequence( bin_op )
+            void bin_op : value operator value // void type is optional
+            { $display("%s %b %b", operator, value[1], value[2]); }
+            ;
+            bit [7:0] value : { return 8'($urandom); } ;
+            string operator : add := 5 { return "+" ; }
+                            | dec := 2 { return "-" ; }
+                            | mult := 1 { return "*" ; }
+            ;
+            add : { $display("add"); };
+            dec : { $display("dec"); };
+            mult : { $display("mult"); };
+        endsequence
+
+        randsequence( A )
+            void A : A1 A2;
+            void A1 : { cnt = 1; } B repeat(5) C B 
+            { $display("c=%d, b1=%d, b2=%d", C, B[1], B[2]); }
+            ;
+            void A2 : if (a) D(5) else D(20) 
+            { $display("d1=%d, d2=%d", D[1], D[2]); }
+            ;
+            int B : C { return C;}
+                  | C C { return C[2]; }
+                  | C C C { return C[3]; }
+            ;
+            int C : { cnt = cnt + 1; return cnt; };
+            int D (int prm) : { return prm; };
+        endsequence
+    end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("randsequence errors") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    int baz[];
+    initial begin
+        randsequence (main)
+            main : first foo | rand join (baz) first first;
+            first : if (baz) main := baz { $display("SDF"); } | repeat (baz) main;
+            int bar(string first) : first;
+            boz : bar bar("asdf") { $display(bar[0]); };
+        endsequence
+
+        randsequence()
+            foo (string s) : { $display(s); };
+        endsequence
+    end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 9);
+    CHECK(diags[0].code == diag::UndeclaredIdentifier);
+    CHECK(diags[1].code == diag::RandJoinNotNumeric);
+    CHECK(diags[2].code == diag::NotBooleanConvertible);
+    CHECK(diags[3].code == diag::ExprMustBeIntegral);
+    CHECK(diags[4].code == diag::ExprMustBeIntegral);
+    CHECK(diags[5].code == diag::NotAProduction);
+    CHECK(diags[6].code == diag::TooFewArguments);
+    CHECK(diags[7].code == diag::IndexValueInvalid);
+    CHECK(diags[8].code == diag::TooFewArguments);
+}
+
+TEST_CASE("foreach loop non-standard syntax") {
+    auto tree = SyntaxTree::fromText(R"(
+module top;
+    int array[8][8];
+    initial begin
+        foreach (array[i]) begin
+            foreach (array[i][j]) begin
+                array[i][j] = i * j;
+            end
+        end
+    end
+endmodule
+
+class A;
+    int subhash[string];
+endclass
+class C;
+    A hash[string];
+    task t(string index);
+        foreach (hash[index].subhash[i]) begin
+        end
+    endtask
+endclass
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 1);
+    CHECK(diags[0].code == diag::NonstandardForeach);
 }

@@ -189,9 +189,14 @@ const Symbol* unwrapTypeParam(const Symbol* symbol) {
     return symbol;
 }
 
-bool isClassType(const Symbol& symbol) {
-    if (symbol.isType())
-        return symbol.as<Type>().isClass();
+optional<bool> isClassType(const Symbol& symbol) {
+    if (symbol.isType()) {
+        auto& type = symbol.as<Type>();
+        if (type.isError())
+            return std::nullopt;
+
+        return type.isClass();
+    }
 
     return symbol.kind == SymbolKind::GenericClassDef;
 }
@@ -243,9 +248,21 @@ bool lookupDownward(span<const NamePlusLoc> nameParts, NameComponents name,
         if (!checkClassParams(name))
             return false;
 
+        auto isValueLike = [](const Symbol& symbol) {
+            switch (symbol.kind) {
+                case SymbolKind::ConstraintBlock:
+                case SymbolKind::Sequence:
+                case SymbolKind::Property:
+                case SymbolKind::LetDecl:
+                case SymbolKind::AssertionPort:
+                    return true;
+                default:
+                    return symbol.isValue();
+            }
+        };
+
         // If we found a value, the remaining dots are member access expressions.
-        if (symbol->isValue() || symbol->kind == SymbolKind::ConstraintBlock ||
-            symbol->kind == SymbolKind::Sequence || symbol->kind == SymbolKind::Property) {
+        if (isValueLike(*symbol)) {
             if (name.selectors)
                 result.selectors.appendRange(*name.selectors);
 
@@ -301,7 +318,16 @@ bool lookupDownward(span<const NamePlusLoc> nameParts, NameComponents name,
             if (!symbol)
                 return false;
 
-            bool isType = symbol->isType() || isClassType(*symbol);
+            bool isType;
+            if (symbol->isType()) {
+                isType = true;
+                if (symbol->as<Type>().isError())
+                    return false;
+            }
+            else {
+                isType = symbol->kind == SymbolKind::GenericClassDef;
+            }
+
             auto code = isType ? diag::DotOnType : diag::NotAHierarchicalScope;
             auto& diag = result.addDiag(*context.scope, code, it->dotLocation);
             diag << name.range();
@@ -571,7 +597,16 @@ bool resolveColonNames(SmallVectorSized<NamePlusLoc, 8>& nameParts, int colonPar
 
     // If the prefix name resolved normally to a class object, use that. Otherwise we need
     // to look for a package with the corresponding name.
-    if (!symbol || !isClassType(*symbol)) {
+    bool lookForPackage = symbol == nullptr;
+    if (symbol) {
+        auto isClass = isClassType(*symbol);
+        if (!isClass.has_value())
+            return false;
+
+        lookForPackage = !isClass.value();
+    }
+
+    if (lookForPackage) {
         symbol = context.getCompilation().getPackage(name.text());
         if (!symbol) {
             if (!context.scope->isUninstantiated()) {
@@ -626,7 +661,6 @@ bool resolveColonNames(SmallVectorSized<NamePlusLoc, 8>& nameParts, int colonPar
         return true;
     };
 
-    bool isClass = false;
     while (colonParts--) {
         if (name.selectors) {
             result.addDiag(*context.scope, diag::InvalidScopeIndexExpression,
@@ -639,13 +673,18 @@ bool resolveColonNames(SmallVectorSized<NamePlusLoc, 8>& nameParts, int colonPar
         if (!symbol)
             return false;
 
-        isClass = isClassType(*symbol);
-        if (symbol->kind != SymbolKind::Package && !isClass) {
-            auto& diag = result.addDiag(*context.scope, diag::NotAClass, part.dotLocation);
-            diag << name.range();
-            diag << symbol->name;
-            diag.addNote(diag::NoteDeclarationHere, symbol->location);
-            return false;
+        if (symbol->kind != SymbolKind::Package) {
+            auto isClass = isClassType(*symbol);
+            if (!isClass.has_value())
+                return false;
+
+            if (!isClass.value()) {
+                auto& diag = result.addDiag(*context.scope, diag::NotAClass, part.dotLocation);
+                diag << name.range();
+                diag << symbol->name;
+                diag.addNote(diag::NoteDeclarationHere, symbol->location);
+                return false;
+            }
         }
 
         if (!validateSymbol())
@@ -659,7 +698,11 @@ bool resolveColonNames(SmallVectorSized<NamePlusLoc, 8>& nameParts, int colonPar
             symbol = &symbol->as<Type>().getCanonicalType();
 
         const Symbol* savedSymbol = symbol;
-        symbol = symbol->as<Scope>().find(name.text());
+        if (symbol->kind == SymbolKind::Package)
+            symbol = symbol->as<PackageSymbol>().findForImport(name.text());
+        else
+            symbol = symbol->as<Scope>().find(name.text());
+
         if (!symbol) {
             DiagCode code = diag::UnknownClassMember;
             if (savedSymbol->kind == SymbolKind::Package)
@@ -722,7 +765,8 @@ void unwrapResult(const Scope& scope, optional<SourceRange> range, LookupResult&
 const Symbol* findThisHandle(const Scope& scope, SourceRange range, LookupResult& result) {
     // Find the parent method, if we can.
     const Symbol* parent = &scope.asSymbol();
-    while (parent->kind == SymbolKind::StatementBlock) {
+    while (parent->kind == SymbolKind::StatementBlock ||
+           parent->kind == SymbolKind::RandSeqProduction) {
         auto parentScope = parent->getParentScope();
         ASSERT(parentScope);
         parent = &parentScope->asSymbol();
@@ -950,7 +994,7 @@ static const Symbol* selectChildRange(const InstanceArraySymbol& array,
     if (begin > end)
         std::swap(begin, end);
 
-    auto elems = array.elements.subspan(size_t(begin), size_t(end - begin + 1));
+    auto elems = array.elements.subspan(size_t(begin), size_t(end - begin) + 1);
 
     ConstantRange newRange{ int32_t(selRange.width()) - 1, 0 };
     if (!selRange.isLittleEndian())
@@ -1055,10 +1099,16 @@ std::pair<const ClassType*, bool> Lookup::getContainingClass(const Scope& scope)
     const Symbol* parent = &scope.asSymbol();
     bool inStatic = false;
     while (parent->kind == SymbolKind::StatementBlock || parent->kind == SymbolKind::Subroutine ||
-           parent->kind == SymbolKind::ConstraintBlock) {
+           parent->kind == SymbolKind::MethodPrototype ||
+           parent->kind == SymbolKind::ConstraintBlock ||
+           parent->kind == SymbolKind::RandSeqProduction) {
         if (parent->kind == SymbolKind::Subroutine) {
             // Remember whether this was a static class method.
-            if (parent->as<SubroutineSymbol>().flags & MethodFlags::Static)
+            if (parent->as<SubroutineSymbol>().flags.has(MethodFlags::Static))
+                inStatic = true;
+        }
+        else if (parent->kind == SymbolKind::MethodPrototype) {
+            if (parent->as<MethodPrototypeSymbol>().flags.has(MethodFlags::Static))
                 inStatic = true;
         }
 
@@ -1118,8 +1168,8 @@ bool Lookup::ensureVisible(const Symbol& symbol, const BindContext& context,
 
 bool Lookup::ensureAccessible(const Symbol& symbol, const BindContext& context,
                               optional<SourceRange> sourceRange) {
-    if (context.classRandomizeScope &&
-        symbol.getParentScope() == context.classRandomizeScope->classType) {
+    if (context.randomizeDetails && context.randomizeDetails->classType &&
+        Lookup::isAccessibleFrom(symbol, context.randomizeDetails->classType->asSymbol())) {
         return true;
     }
 
@@ -1233,13 +1283,51 @@ bool Lookup::withinClassRandomize(const Scope& scope, span<const string_view> na
     BindContext context(scope, LookupLocation::max);
     if (colonParts) {
         // Disallow package lookups in this function.
-        if (!isClassType(*result.found))
+        auto isClass = isClassType(*result.found);
+        if (!isClass.has_value() || !isClass.value())
             return false;
 
         return resolveColonNames(nameParts, colonParts, name, flags, result, context);
     }
 
     return lookupDownward(nameParts, name, context, result, flags);
+}
+
+bool Lookup::findAssertionLocalVar(const BindContext& context, const NameSyntax& syntax,
+                                   LookupResult& result) {
+    int colonParts = 0;
+    SmallVectorSized<NamePlusLoc, 8> nameParts;
+    const NameSyntax* first = &syntax;
+    if (syntax.kind == SyntaxKind::ScopedName) {
+        first = splitScopedName(syntax.as<ScopedNameSyntax>(), nameParts, colonParts);
+        if (colonParts)
+            return false;
+    }
+
+    NameComponents name;
+    switch (first->kind) {
+        case SyntaxKind::IdentifierName:
+        case SyntaxKind::IdentifierSelectName:
+        case SyntaxKind::ClassName:
+            name = *first;
+            break;
+        default:
+            return false;
+    }
+
+    auto inst = context.assertionInstance;
+    ASSERT(inst);
+
+    while (inst->argDetails)
+        inst = inst->argDetails;
+
+    auto& map = inst->localVars;
+    auto it = map.find(name.text());
+    if (it == map.end())
+        return false;
+
+    result.found = it->second;
+    return lookupDownward(nameParts, name, context, result, LookupFlags::None);
 }
 
 void Lookup::unqualifiedImpl(const Scope& scope, string_view name, LookupLocation location,
@@ -1315,6 +1403,9 @@ void Lookup::unqualifiedImpl(const Scope& scope, string_view name, LookupLocatio
                     // Looking up a prototype should always forward on to the actual method.
                     result.found = symbol->as<MethodPrototypeSymbol>().getSubroutine();
                     break;
+                case SymbolKind::ModportClocking:
+                    result.found = symbol->as<ModportClockingSymbol>().target;
+                    break;
                 default:
                     result.found = symbol;
                     break;
@@ -1343,50 +1434,75 @@ void Lookup::unqualifiedImpl(const Scope& scope, string_view name, LookupLocatio
 
     // Look through any wildcard imports prior to the lookup point and see if their packages
     // contain the name we're looking for.
-    struct Import {
-        const Symbol* imported;
-        const WildcardImportSymbol* import;
-    };
-    SmallVectorSized<Import, 8> imports;
+    auto wildcardImports = scope.getWildcardImports();
+    if (!wildcardImports.empty()) {
+        struct Import {
+            const Symbol* imported;
+            const WildcardImportSymbol* import;
+        };
+        SmallVectorSized<Import, 8> imports;
+        SmallSet<const Symbol*, 2> importDedup;
 
-    for (auto import : scope.getWildcardImports()) {
-        if (location < LookupLocation::after(*import))
-            break;
+        for (auto import : wildcardImports) {
+            if (location < LookupLocation::after(*import))
+                break;
 
-        auto package = import->getPackage();
-        if (!package) {
-            result.sawBadImport = true;
-            continue;
+            auto package = import->getPackage();
+            if (!package) {
+                result.sawBadImport = true;
+                continue;
+            }
+
+            const Symbol* imported = package->findForImport(name);
+            if (imported && importDedup.emplace(imported).second)
+                imports.emplace(Import{ imported, import });
         }
 
-        const Symbol* imported = package->find(name);
-        if (imported)
-            imports.emplace(Import{ imported, import });
-    }
+        if (!imports.empty()) {
+            if (imports.size() > 1) {
+                if (sourceRange) {
+                    auto& diag = result.addDiag(scope, diag::AmbiguousWildcardImport, *sourceRange);
+                    diag << name;
+                    for (const auto& pair : imports) {
+                        diag.addNote(diag::NoteImportedFrom, pair.import->location);
+                        diag.addNote(diag::NoteDeclarationHere, pair.imported->location);
+                    }
+                }
+                return;
+            }
 
-    if (!imports.empty()) {
-        if (imports.size() > 1) {
-            if (sourceRange) {
-                auto& diag = result.addDiag(scope, diag::AmbiguousWildcardImport, *sourceRange);
-                diag << name;
-                for (const auto& pair : imports) {
-                    diag.addNote(diag::NoteImportedFrom, pair.import->location);
-                    diag.addNote(diag::NoteDeclarationHere, pair.imported->location);
+            if (symbol && sourceRange) {
+                // The existing symbol might be an import for the thing we just imported
+                // via wildcard, which is fine so don't error for that case.
+                if (symbol->kind != SymbolKind::ExplicitImport ||
+                    symbol->as<ExplicitImportSymbol>().importedSymbol() != imports[0].imported) {
+
+                    auto& diag = result.addDiag(scope, diag::ImportNameCollision, *sourceRange);
+                    diag << name;
+                    diag.addNote(diag::NoteDeclarationHere, symbol->location);
+                    diag.addNote(diag::NoteImportedFrom, imports[0].import->location);
+                    diag.addNote(diag::NoteDeclarationHere, imports[0].imported->location);
                 }
             }
+
+            result.wasImported = true;
+            result.found = imports[0].imported;
+
+            // If we are doing this lookup from a scope that is within a package declaration
+            // we should note that fact so that it can later be exported if desired.
+            auto currScope = &scope;
+            do {
+                auto& sym = currScope->asSymbol();
+                if (sym.kind == SymbolKind::Package) {
+                    sym.as<PackageSymbol>().noteImport(*result.found);
+                    break;
+                }
+
+                currScope = sym.getParentScope();
+            } while (currScope);
+
             return;
         }
-
-        if (symbol && sourceRange) {
-            auto& diag = result.addDiag(scope, diag::ImportNameCollision, *sourceRange) << name;
-            diag.addNote(diag::NoteDeclarationHere, symbol->location);
-            diag.addNote(diag::NoteImportedFrom, imports[0].import->location);
-            diag.addNote(diag::NoteDeclarationHere, imports[0].imported->location);
-        }
-
-        result.wasImported = true;
-        result.found = imports[0].imported;
-        return;
     }
 
     // Continue up the scope chain via our parent.
@@ -1440,7 +1556,7 @@ void Lookup::qualified(const ScopedNameSyntax& syntax, const BindContext& contex
     bool inConstantEval = (flags & LookupFlags::Constant) != 0;
 
     if (leftMost->kind == SyntaxKind::LocalScope) {
-        if (!context.classRandomizeScope) {
+        if (!context.randomizeDetails || !context.randomizeDetails->classType) {
             result.addDiag(scope, diag::LocalNotAllowed, first.range());
             return;
         }

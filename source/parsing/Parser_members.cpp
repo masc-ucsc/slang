@@ -150,9 +150,9 @@ MemberSyntax* Parser::parseMember(SyntaxKind parentKind, bool& anyLocalModules) 
             errorIfAttributes(attributes);
             return &parseSpecifyBlock(attributes);
         case TokenKind::Identifier:
-            // Declarations and instantiations have already been handled, so if we reach this point
-            // we either have a labeled assertion, or this is some kind of error.
             if (peek(1).kind == TokenKind::Colon) {
+                // Declarations and instantiations have already been handled, so if we reach this
+                // point we either have a labeled assertion, or this is some kind of error.
                 TokenKind next = peek(2).kind;
                 if (next == TokenKind::AssertKeyword || next == TokenKind::AssumeKeyword ||
                     next == TokenKind::CoverKeyword) {
@@ -174,11 +174,29 @@ MemberSyntax* Parser::parseMember(SyntaxKind parentKind, bool& anyLocalModules) 
             }
 
             // If there's a hash or parenthesis here this is likely a primitive instantiation.
-            if (peek(1).kind == TokenKind::Hash || peek(1).kind == TokenKind::OpenParenthesis)
+            if (peek(1).kind == TokenKind::Hash || peek(1).kind == TokenKind::OpenParenthesis) {
                 return &parsePrimitiveInstantiation(attributes);
+            }
 
-            // Otherwise, assume it's an attempt at a variable declaration.
+            // A double colon could be a package-scoped checker instantiation.
+            if (peek(1).kind == TokenKind::DoubleColon && peek(2).kind == TokenKind::Identifier &&
+                peek(3).kind == TokenKind::Identifier) {
+                return &parseCheckerInstantiation(attributes);
+            }
+
+            // Otherwise, assume it's an (erroneous) attempt at a variable declaration.
             return &parseVariableDeclaration(attributes);
+        case TokenKind::UnitSystemName: {
+            // The only valid thing this can be is a checker instantiation, since
+            // variable declarations would have been handled previously. Because these
+            // are rare, disambiguate for a bit and then fall back to parsing as a
+            // variable decl anyway for a better error message.
+            if (peek(1).kind == TokenKind::DoubleColon && peek(2).kind == TokenKind::Identifier &&
+                peek(3).kind == TokenKind::Identifier) {
+                return &parseCheckerInstantiation(attributes);
+            }
+            return &parseVariableDeclaration(attributes);
+        }
         case TokenKind::AssertKeyword:
         case TokenKind::AssumeKeyword:
         case TokenKind::CoverKeyword:
@@ -275,6 +293,10 @@ MemberSyntax* Parser::parseMember(SyntaxKind parentKind, bool& anyLocalModules) 
             return &parseConstraint(attributes, {});
         case TokenKind::PrimitiveKeyword:
             return &parseUdpDeclaration(attributes);
+        case TokenKind::RandKeyword: {
+            auto rand = consume();
+            return &factory.checkerDataDeclaration(attributes, rand, parseDataDeclaration({}));
+        }
         default:
             break;
     }
@@ -880,9 +902,11 @@ ClassDeclarationSyntax& Parser::parseClassDeclaration(AttrList attributes,
     auto endBlockName = parseNamedBlockClause();
     checkBlockNames(name, endBlockName);
 
-    return factory.classDeclaration(attributes, virtualOrInterface, classKeyword, lifetime, name,
-                                    parameterList, extendsClause, implementsClause, semi, members,
-                                    endClass, endBlockName);
+    auto& result = factory.classDeclaration(attributes, virtualOrInterface, classKeyword, lifetime,
+                                            name, parameterList, extendsClause, implementsClause,
+                                            semi, members, endClass, endBlockName);
+    meta.classDecls.append(&result);
+    return result;
 }
 
 void Parser::checkClassQualifiers(span<const Token> qualifiers, bool isConstraint) {
@@ -984,30 +1008,30 @@ MemberSyntax* Parser::parseClassMember(bool isIfaceClass) {
 
     auto attributes = parseAttributes();
 
-    // virtual keyword can either be a class decl, virtual interface, or a method qualifier;
-    // early out here if it's a class or interface
-    if (peek(TokenKind::VirtualKeyword)) {
-        switch (peek(1).kind) {
-            case TokenKind::ClassKeyword: {
-                auto& result = parseClassDeclaration(attributes, consume());
-                errorIfIface(result);
-                return &result;
-            }
-            case TokenKind::InterfaceKeyword:
-            case TokenKind::Identifier: {
-                auto& result = factory.classPropertyDeclaration(attributes, nullptr,
-                                                                parseVariableDeclaration({}));
-                errorIfIface(result);
-                return &result;
-            }
-            default:
-                break;
-        }
+    // virtual keyword can either be a class decl, virtual interface, or a method qualifier.
+    // Early out here if it's a class.
+    if (peek(TokenKind::VirtualKeyword) && peek(1).kind == TokenKind::ClassKeyword) {
+        auto& result = parseClassDeclaration(attributes, consume());
+        errorIfIface(result);
+        return &result;
     }
 
     bool isPureOrExtern = false;
     SmallVectorSized<Token, 4> qualifierBuffer;
     while (isMemberQualifier(peek().kind)) {
+        // As mentioned above, the virtual keyword needs special handling
+        // because it might be a virtual method or a virtual interface property.
+        if (peek(TokenKind::VirtualKeyword) && !isPureOrExtern) {
+            // If the next token after this is another qualifier or a method
+            // keyword then we should take it; otherwise assume that it will
+            // be parsed as a variable declaration.
+            auto kind = peek(1).kind;
+            if (!isMemberQualifier(kind) && kind != TokenKind::FunctionKeyword &&
+                kind != TokenKind::TaskKeyword) {
+                break;
+            }
+        }
+
         Token t = consume();
         qualifierBuffer.append(t);
         if (t.kind == TokenKind::PureKeyword || t.kind == TokenKind::ExternKeyword)
@@ -1429,7 +1453,7 @@ MemberSyntax* Parser::parseCoverpointMember() {
 TransRangeSyntax& Parser::parseTransRange() {
     SmallVectorSized<TokenOrSyntax, 8> buffer;
     while (true) {
-        buffer.append(&parseOpenRangeElement());
+        buffer.append(&parseOpenRangeElement(ExpressionOptions::SequenceExpr));
         if (!peek(TokenKind::Comma))
             break;
 
@@ -1883,7 +1907,9 @@ PackageImportDeclarationSyntax& Parser::parseImportDeclaration(AttrList attribut
                                                 RequireItems::True, diag::ExpectedPackageImport,
                                                 [this] { return &parsePackageImportItem(); });
 
-    return factory.packageImportDeclaration(attributes, keyword, items.copy(alloc), semi);
+    auto& result = factory.packageImportDeclaration(attributes, keyword, items.copy(alloc), semi);
+    meta.packageImports.append(&result);
+    return result;
 }
 
 PackageImportItemSyntax& Parser::parsePackageImportItem() {
@@ -1987,13 +2013,30 @@ ElabSystemTaskSyntax* Parser::parseElabSystemTask(AttrList attributes) {
     return &factory.elabSystemTask(attributes, nameToken, argList, expect(TokenKind::Semicolon));
 }
 
-AssertionItemPortSyntax& Parser::parseAssertionItemPort() {
+AssertionItemPortSyntax& Parser::parseAssertionItemPort(SyntaxKind parentKind) {
     auto attributes = parseAttributes();
     auto local = consumeIf(TokenKind::LocalKeyword);
 
     Token direction;
-    if (isPortDirection(peek().kind))
+    if (isPortDirection(peek().kind)) {
         direction = consume();
+
+        bool isSeqOrProp = parentKind == SyntaxKind::SequenceDeclaration ||
+                           parentKind == SyntaxKind::PropertyDeclaration;
+        if (!local && isSeqOrProp)
+            addDiag(diag::AssertionPortDirNoLocal, direction.location()) << direction.range();
+    }
+
+    if (parentKind == SyntaxKind::LetDeclaration) {
+        if (local) {
+            addDiag(diag::UnexpectedLetPortKeyword, local.location())
+                << local.range() << local.valueText();
+        }
+        else if (direction) {
+            addDiag(diag::UnexpectedLetPortKeyword, direction.location())
+                << direction.range() << direction.valueText();
+        }
+    }
 
     DataTypeSyntax* type;
     switch (peek().kind) {
@@ -2024,7 +2067,7 @@ AssertionItemPortSyntax& Parser::parseAssertionItemPort() {
                                      defaultValue);
 }
 
-AssertionItemPortListSyntax* Parser::parseAssertionItemPortList() {
+AssertionItemPortListSyntax* Parser::parseAssertionItemPortList(SyntaxKind parentKind) {
     if (!peek(TokenKind::OpenParenthesis))
         return nullptr;
 
@@ -2034,7 +2077,8 @@ AssertionItemPortListSyntax* Parser::parseAssertionItemPortList() {
     Token closeParen;
     parseList<isPossiblePropertyPortItem, isEndOfParenList>(
         buffer, TokenKind::CloseParenthesis, TokenKind::Comma, closeParen, RequireItems::True,
-        diag::ExpectedAssertionItemPort, [this] { return &parseAssertionItemPort(); });
+        diag::ExpectedAssertionItemPort,
+        [this, parentKind] { return &parseAssertionItemPort(parentKind); });
 
     return &factory.assertionItemPortList(openParen, buffer.copy(alloc), closeParen);
 }
@@ -2042,12 +2086,12 @@ AssertionItemPortListSyntax* Parser::parseAssertionItemPortList() {
 PropertyDeclarationSyntax& Parser::parsePropertyDeclaration(AttrList attributes) {
     auto keyword = consume();
     auto name = expect(TokenKind::Identifier);
-    auto portList = parseAssertionItemPortList();
+    auto portList = parseAssertionItemPortList(SyntaxKind::PropertyDeclaration);
     auto semi = expect(TokenKind::Semicolon);
 
-    SmallVectorSized<MemberSyntax*, 4> declarations;
-    while (isVariableDeclaration())
-        declarations.append(&parseVariableDeclaration({}));
+    SmallVectorSized<LocalVariableDeclarationSyntax*, 4> declarations;
+    while (isLocalVariableDeclaration())
+        declarations.append(&parseLocalVariableDeclaration());
 
     auto& spec = parsePropertySpec();
     Token optSemi = consumeIf(TokenKind::Semicolon);
@@ -2063,12 +2107,12 @@ PropertyDeclarationSyntax& Parser::parsePropertyDeclaration(AttrList attributes)
 SequenceDeclarationSyntax& Parser::parseSequenceDeclaration(AttrList attributes) {
     auto keyword = consume();
     auto name = expect(TokenKind::Identifier);
-    auto portList = parseAssertionItemPortList();
+    auto portList = parseAssertionItemPortList(SyntaxKind::SequenceDeclaration);
     auto semi = expect(TokenKind::Semicolon);
 
-    SmallVectorSized<MemberSyntax*, 4> declarations;
-    while (isVariableDeclaration())
-        declarations.append(&parseVariableDeclaration({}));
+    SmallVectorSized<LocalVariableDeclarationSyntax*, 4> declarations;
+    while (isLocalVariableDeclaration())
+        declarations.append(&parseLocalVariableDeclaration());
 
     auto& expr = parseSequenceExpr(0, /* isInProperty */ false);
     auto semi2 = expect(TokenKind::Semicolon);
@@ -2084,7 +2128,7 @@ SequenceDeclarationSyntax& Parser::parseSequenceDeclaration(AttrList attributes)
 CheckerDeclarationSyntax& Parser::parseCheckerDeclaration(AttrList attributes) {
     auto keyword = consume();
     auto name = expect(TokenKind::Identifier);
-    auto portList = parseAssertionItemPortList();
+    auto portList = parseAssertionItemPortList(SyntaxKind::CheckerDeclaration);
     auto semi = expect(TokenKind::Semicolon);
 
     auto savedDefinitionKind = currentDefinitionKind;
@@ -2355,6 +2399,19 @@ PrimitiveInstantiationSyntax& Parser::parsePrimitiveInstantiation(AttrList attri
 
     return factory.primitiveInstantiation(attributes, type, strength, delay, items.copy(alloc),
                                           semi);
+}
+
+CheckerInstantiationSyntax& Parser::parseCheckerInstantiation(AttrList attributes) {
+    auto& type = parseName();
+    auto parameters = parseParameterValueAssignment();
+
+    Token semi;
+    SmallVectorSized<TokenOrSyntax, 8> items;
+    parseList<isPossibleInstance, isSemicolon>(
+        items, TokenKind::Semicolon, TokenKind::Comma, semi, RequireItems::True,
+        diag::ExpectedHierarchicalInstantiation, [this] { return &parseHierarchicalInstance(); });
+
+    return factory.checkerInstantiation(attributes, type, parameters, items.copy(alloc), semi);
 }
 
 HierarchicalInstanceSyntax& Parser::parseHierarchicalInstance() {

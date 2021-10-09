@@ -4,6 +4,7 @@
 //
 // File is under the MIT license; see LICENSE for details
 //------------------------------------------------------------------------------
+#include "slang/binding/MiscExpressions.h"
 #include "slang/binding/SystemSubroutine.h"
 #include "slang/compilation/Compilation.h"
 #include "slang/diagnostics/ConstEvalDiags.h"
@@ -68,6 +69,7 @@ public:
             }
 
             auto it = begin(arr);
+            auto guard = context.disableCaching();
             auto iterVal = context.createLocal(iterVar, *it);
             ConstantValue cv = iterExpr->eval(context);
             if (!cv)
@@ -151,6 +153,7 @@ public:
         auto [iterExpr, iterVar] = callInfo.getIteratorInfo();
         if (iterExpr) {
             ASSERT(iterVar);
+            auto guard = context.disableCaching();
             auto iterVal = context.createLocal(iterVar);
 
             auto sortTarget = [&, ie = iterExpr](auto& target) {
@@ -286,6 +289,7 @@ public:
             return nullptr;
 
         auto [iterExpr, iterVar] = callInfo.getIteratorInfo();
+        auto guard = context.disableCaching();
         auto iterVal = context.createLocal(iterVar);
 
         SVQueue results;
@@ -399,6 +403,7 @@ public:
             ASSERT(iterVar);
 
             auto it = begin(arr);
+            auto guard = context.disableCaching();
             auto iterVal = context.createLocal(iterVar, *it);
             ConstantValue elem = *it;
             ConstantValue val = iterExpr->eval(context);
@@ -487,6 +492,7 @@ public:
         auto [iterExpr, iterVar] = callInfo.getIteratorInfo();
         if (iterExpr) {
             ASSERT(iterVar);
+            auto guard = context.disableCaching();
             auto iterVal = context.createLocal(iterVar);
 
             uint32_t index = 0;
@@ -666,7 +672,9 @@ public:
 class AssocArrayTraversalMethod : public SystemSubroutine {
 public:
     explicit AssocArrayTraversalMethod(const std::string& name) :
-        SystemSubroutine(name, SubroutineKind::Function) {}
+        SystemSubroutine(name, SubroutineKind::Function) {
+        hasOutputArgs = true;
+    }
 
     const Expression& bindArgument(size_t argIndex, const BindContext& context,
                                    const ExpressionSyntax& syntax, const Args& args) const final {

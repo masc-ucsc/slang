@@ -118,6 +118,14 @@ size_t Type::bitstreamWidth() const {
             width += field.getType().bitstreamWidth();
     }
 
+    if (isUnpackedUnion()) {
+        // Unpacked unions are not bitstream types but we support
+        // getting a bit width out of them anyway.
+        auto& us = getCanonicalType().as<UnpackedUnionType>();
+        for (const auto& field : us.membersOfType<FieldSymbol>())
+            width = std::max(width, field.getType().bitstreamWidth());
+    }
+
     if (isClass()) {
         auto& ct = getCanonicalType().as<ClassType>();
         if (ct.isInterface)
@@ -275,7 +283,7 @@ bool Type::isBitstreamType(bool destination) const {
 }
 
 bool Type::isFixedSize() const {
-    if (isIntegral())
+    if (isIntegral() || isFloating())
         return true;
 
     if (isUnpackedArray()) {
@@ -288,6 +296,15 @@ bool Type::isFixedSize() const {
 
     if (isUnpackedStruct()) {
         auto& us = getCanonicalType().as<UnpackedStructType>();
+        for (auto& field : us.membersOfType<FieldSymbol>()) {
+            if (!field.getType().isFixedSize())
+                return false;
+        }
+        return true;
+    }
+
+    if (isUnpackedUnion()) {
+        auto& us = getCanonicalType().as<UnpackedUnionType>();
         for (auto& field : us.membersOfType<FieldSymbol>()) {
             if (!field.getType().isFixedSize())
                 return false;
@@ -343,6 +360,29 @@ bool Type::isUnpackedArray() const {
         case SymbolKind::AssociativeArrayType:
         case SymbolKind::QueueType:
             return true;
+        default:
+            return false;
+    }
+}
+
+bool Type::isDynamicallySizedArray() const {
+    switch (getCanonicalType().kind) {
+        case SymbolKind::DynamicArrayType:
+        case SymbolKind::AssociativeArrayType:
+        case SymbolKind::QueueType:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool Type::isTaggedUnion() const {
+    auto& ct = getCanonicalType();
+    switch (ct.kind) {
+        case SymbolKind::PackedUnionType:
+            return ct.as<PackedUnionType>().isTagged;
+        case SymbolKind::UnpackedUnionType:
+            return ct.as<UnpackedUnionType>().isTagged;
         default:
             return false;
     }
@@ -675,7 +715,7 @@ bool Type::isIterable() const {
 }
 
 bool Type::isValidForRand(RandMode mode) const {
-    if (isIntegral() || isNull())
+    if ((isIntegral() || isNull()) && !isTaggedUnion())
         return true;
 
     if (isArray())
@@ -684,7 +724,6 @@ bool Type::isValidForRand(RandMode mode) const {
     if (isClass() || isUnpackedStruct())
         return mode == RandMode::Rand;
 
-    // TODO: rules for tagged unions
     return false;
 }
 
@@ -830,14 +869,12 @@ const Type* Type::getCommonBase(const Type& left, const Type& right) {
 }
 
 const Type& Type::fromSyntax(Compilation& compilation, const DataTypeSyntax& node,
-                             LookupLocation location, const Scope& parent,
-                             const Type* typedefTarget) {
+                             const BindContext& context, const Type* typedefTarget) {
     switch (node.kind) {
         case SyntaxKind::BitType:
         case SyntaxKind::LogicType:
         case SyntaxKind::RegType:
-            return IntegralType::fromSyntax(compilation, node.as<IntegerTypeSyntax>(), location,
-                                            parent);
+            return IntegralType::fromSyntax(compilation, node.as<IntegerTypeSyntax>(), context);
         case SyntaxKind::ByteType:
         case SyntaxKind::ShortIntType:
         case SyntaxKind::IntType:
@@ -847,8 +884,8 @@ const Type& Type::fromSyntax(Compilation& compilation, const DataTypeSyntax& nod
             auto& its = node.as<IntegerTypeSyntax>();
             if (!its.dimensions.empty()) {
                 // Error but don't fail out; just remove the dims and keep trucking
-                auto& diag = parent.addDiag(diag::PackedDimsOnPredefinedType,
-                                            its.dimensions[0]->openBracket.location());
+                auto& diag = context.addDiag(diag::PackedDimsOnPredefinedType,
+                                             its.dimensions[0]->openBracket.location());
                 diag << LexerFacts::getTokenKindText(its.keyword.kind);
             }
 
@@ -870,38 +907,37 @@ const Type& Type::fromSyntax(Compilation& compilation, const DataTypeSyntax& nod
         case SyntaxKind::SequenceType:
             return compilation.getType(node.kind);
         case SyntaxKind::EnumType:
-            return EnumType::fromSyntax(compilation, node.as<EnumTypeSyntax>(), location, parent,
+            return EnumType::fromSyntax(compilation, node.as<EnumTypeSyntax>(), context,
                                         typedefTarget);
         case SyntaxKind::StructType: {
             const auto& structUnion = node.as<StructUnionTypeSyntax>();
             return structUnion.packed
-                       ? PackedStructType::fromSyntax(compilation, structUnion, location, parent)
-                       : UnpackedStructType::fromSyntax(parent, location, structUnion);
+                       ? PackedStructType::fromSyntax(compilation, structUnion, context)
+                       : UnpackedStructType::fromSyntax(context, structUnion);
         }
         case SyntaxKind::UnionType: {
             const auto& structUnion = node.as<StructUnionTypeSyntax>();
             return structUnion.packed
-                       ? PackedUnionType::fromSyntax(compilation, structUnion, location, parent)
-                       : UnpackedUnionType::fromSyntax(parent, location, structUnion);
+                       ? PackedUnionType::fromSyntax(compilation, structUnion, context)
+                       : UnpackedUnionType::fromSyntax(context, structUnion);
         }
         case SyntaxKind::NamedType:
-            return lookupNamedType(compilation, *node.as<NamedTypeSyntax>().name, location, parent,
+            return lookupNamedType(compilation, *node.as<NamedTypeSyntax>().name, context,
                                    typedefTarget != nullptr);
         case SyntaxKind::ImplicitType: {
             auto& implicit = node.as<ImplicitTypeSyntax>();
             return IntegralType::fromSyntax(compilation, SyntaxKind::LogicType, implicit.dimensions,
                                             implicit.signing.kind == TokenKind::SignedKeyword,
-                                            location, parent);
+                                            context);
         }
         case SyntaxKind::TypeReference: {
-            BindContext context(parent, location, BindFlags::NoHierarchicalNames);
-            auto& expr = Expression::bind(*node.as<TypeReferenceSyntax>().expr, context,
+            auto& expr = Expression::bind(*node.as<TypeReferenceSyntax>().expr,
+                                          context.resetFlags(BindFlags::NoHierarchicalNames),
                                           BindFlags::AllowDataType);
             return *expr.type;
         }
         case SyntaxKind::VirtualInterfaceType:
-            return VirtualInterfaceType::fromSyntax(parent, location,
-                                                    node.as<VirtualInterfaceTypeSyntax>());
+            return VirtualInterfaceType::fromSyntax(context, node.as<VirtualInterfaceTypeSyntax>());
         default:
             THROW_UNREACHABLE;
     }
@@ -909,11 +945,19 @@ const Type& Type::fromSyntax(Compilation& compilation, const DataTypeSyntax& nod
 
 const Type& Type::fromSyntax(Compilation& compilation, const Type& elementType,
                              const SyntaxList<VariableDimensionSyntax>& dimensions,
-                             LookupLocation location, const Scope& scope) {
+                             const BindContext& context) {
     if (elementType.isError())
         return elementType;
 
-    BindContext context(scope, location);
+    switch (elementType.getCanonicalType().kind) {
+        case SymbolKind::SequenceType:
+        case SymbolKind::PropertyType:
+        case SymbolKind::UntypedType:
+            context.addDiag(diag::InvalidArrayElemType, dimensions.sourceRange()) << elementType;
+            return compilation.getErrorType();
+        default:
+            break;
+    }
 
     const Type* result = &elementType;
     size_t count = dimensions.size();
@@ -991,35 +1035,30 @@ void Type::resolveCanonical() const {
 }
 
 const Type& Type::lookupNamedType(Compilation& compilation, const NameSyntax& syntax,
-                                  LookupLocation location, const Scope& parent,
-                                  bool isTypedefTarget) {
+                                  const BindContext& context, bool isTypedefTarget) {
     bitmask<LookupFlags> flags = LookupFlags::Type;
     if (isTypedefTarget)
         flags |= LookupFlags::TypedefTarget;
 
     LookupResult result;
-    BindContext context(parent, location);
     Lookup::name(syntax, context, flags, result);
 
     if (result.hasError())
         compilation.addDiagnostics(result.getDiagnostics());
 
-    return fromLookupResult(compilation, result, syntax, location, parent);
+    return fromLookupResult(compilation, result, syntax, context);
 }
 
 const Type& Type::fromLookupResult(Compilation& compilation, const LookupResult& result,
-                                   const NameSyntax& syntax, LookupLocation location,
-                                   const Scope& parent) {
+                                   const NameSyntax& syntax, const BindContext& context) {
     const Symbol* symbol = result.found;
     if (!symbol)
         return compilation.getErrorType();
 
     if (!symbol->isType()) {
-        parent.addDiag(diag::NotAType, syntax.sourceRange()) << symbol->name;
+        context.addDiag(diag::NotAType, syntax.sourceRange()) << symbol->name;
         return compilation.getErrorType();
     }
-
-    BindContext context(parent, location);
 
     const Type* finalType = &symbol->as<Type>();
     size_t count = result.selectors.size();
@@ -1030,7 +1069,7 @@ const Type& Type::fromLookupResult(Compilation& compilation, const LookupResult&
         if (!dim)
             return compilation.getErrorType();
 
-        finalType = &PackedArrayType::fromSyntax(parent, *finalType, *dim, *selectSyntax);
+        finalType = &PackedArrayType::fromSyntax(*context.scope, *finalType, *dim, *selectSyntax);
     }
 
     return *finalType;

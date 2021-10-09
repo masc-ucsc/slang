@@ -154,8 +154,14 @@ void Scope::addMember(const Symbol& symbol) {
     const DeclaredType* declaredType = symbol.getDeclaredType();
     if (declaredType) {
         auto syntax = declaredType->getTypeSyntax();
-        if (syntax && syntax->kind == SyntaxKind::EnumType)
+        if (syntax && syntax->kind == SyntaxKind::EnumType) {
             getOrAddDeferredData().registerTransparentType(lastMember, symbol);
+            insertMember(&symbol, lastMember, false, true);
+
+            // Make extra space in the scope for the enum members to be inserted.
+            symbol.indexInScope += 1;
+            return;
+        }
     }
 
     insertMember(&symbol, lastMember, false, true);
@@ -193,6 +199,34 @@ void Scope::addMembers(const SyntaxNode& syntax) {
 
                     import->setSyntax(*item);
                     import->setAttributes(*this, importDecl.attributes);
+                    addMember(*import);
+                }
+            }
+            break;
+        }
+        case SyntaxKind::PackageExportDeclaration: {
+            auto& exportDecl = syntax.as<PackageExportDeclarationSyntax>();
+            for (auto item : exportDecl.items) {
+                if (item->item.kind == TokenKind::Star) {
+                    // These are handled manually as "wildcard imports" but don't get
+                    // added to the import list. This is done just so that the package
+                    // name itself gets validated and the attributes have somewhere to live.
+                    // The actual export functionality is handled in PackageSymbol.
+                    auto import = compilation.emplace<WildcardImportSymbol>(
+                        item->package.valueText(), item->item.location());
+
+                    import->setSyntax(*item);
+                    import->setAttributes(*this, exportDecl.attributes);
+                    import->isFromExport = true;
+                    addMember(*import);
+                }
+                else {
+                    auto import = compilation.emplace<ExplicitImportSymbol>(
+                        item->package.valueText(), item->item.valueText(), item->item.location());
+
+                    import->setSyntax(*item);
+                    import->setAttributes(*this, exportDecl.attributes);
+                    import->isFromExport = true;
                     addMember(*import);
                 }
             }
@@ -322,6 +356,7 @@ void Scope::addMembers(const SyntaxNode& syntax) {
             addMember(NetType::fromSyntax(*this, syntax.as<NetTypeDeclarationSyntax>()));
             break;
         case SyntaxKind::TimeUnitsDeclaration:
+        case SyntaxKind::PackageExportAllDeclaration:
             // These are handled elsewhere; just ignore here.
             break;
         case SyntaxKind::GenvarDeclaration: {
@@ -428,6 +463,9 @@ void Scope::addMembers(const SyntaxNode& syntax) {
             addMember(
                 ClockingBlockSymbol::fromSyntax(*this, syntax.as<ClockingDeclarationSyntax>()));
             break;
+        case SyntaxKind::LetDeclaration:
+            addMember(LetDeclSymbol::fromSyntax(*this, syntax.as<LetDeclarationSyntax>()));
+            break;
         case SyntaxKind::PulseStyleDeclaration:
         case SyntaxKind::PathDeclaration:
         case SyntaxKind::IfNonePathDeclaration:
@@ -462,6 +500,8 @@ const Symbol* Scope::find(string_view name) const {
             return nullptr;
         case SymbolKind::MethodPrototype:
             return symbol->as<MethodPrototypeSymbol>().getSubroutine();
+        case SymbolKind::ModportClocking:
+            return symbol->as<ModportClockingSymbol>().target;
         default:
             return symbol;
     }
@@ -589,13 +629,15 @@ void Scope::handleNameConflict(const Symbol& member, const Symbol*& existing,
         }
     }
 
-    if (existing->kind == SymbolKind::ExplicitImport && member.kind == SymbolKind::ExplicitImport &&
-        existing->as<ExplicitImportSymbol>().packageName ==
-            member.as<ExplicitImportSymbol>().packageName) {
-        // Duplicate explicit imports are specifically allowed,
-        // so just ignore the other one (with a warning).
-        auto& diag = addDiag(diag::DuplicateImport, member.location);
-        diag.addNote(diag::NotePreviousDefinition, existing->location);
+    if (existing->kind == SymbolKind::ExplicitImport && member.kind == SymbolKind::ExplicitImport) {
+        if (!isElaborating) {
+            // These can't be checked until we can resolve the imports and see if they point to
+            // the same symbol.
+            getOrAddDeferredData().addNameConflict(member);
+        }
+        else {
+            checkImportConflict(member, *existing);
+        }
         return;
     }
 
@@ -675,6 +717,28 @@ void Scope::reportNameConflict(const Symbol& member, const Symbol& existing) con
     diag->addNote(diag::NotePreviousDefinition, existing.location);
 }
 
+void Scope::checkImportConflict(const Symbol& member, const Symbol& existing) const {
+    auto& mei = member.as<ExplicitImportSymbol>();
+    auto& eei = existing.as<ExplicitImportSymbol>();
+
+    auto s1 = mei.importedSymbol();
+    auto s2 = eei.importedSymbol();
+    if (!s1 || !s2)
+        return;
+
+    if (s1 == s2) {
+        if (!mei.isFromExport && !eei.isFromExport) {
+            // Duplicate explicit imports are specifically allowed,
+            // so just ignore the other one (with a warning).
+            auto& diag = addDiag(diag::DuplicateImport, member.location);
+            diag.addNote(diag::NotePreviousDefinition, existing.location);
+        }
+    }
+    else {
+        reportNameConflict(member, existing);
+    }
+}
+
 void Scope::elaborate() const {
     ASSERT(deferredMemberIndex != DeferredMemberIndex::Invalid);
     auto deferredData = compilation.getOrAddDeferredData(deferredMemberIndex);
@@ -682,13 +746,10 @@ void Scope::elaborate() const {
 
     for (auto member : deferredData.getNameConflicts()) {
         auto existing = nameMap->find(member->name)->second;
-        reportNameConflict(*member, *existing);
-    }
-
-    // If this is a class type being elaborated, let it inherit members from parent classes.
-    if (thisSym->kind == SymbolKind::ClassType) {
-        thisSym->as<ClassType>().inheritMembers(
-            [this](const Symbol& member) { insertMember(&member, nullptr, true, true); });
+        if (member->kind == SymbolKind::ExplicitImport)
+            checkImportConflict(*member, *existing);
+        else
+            reportNameConflict(*member, *existing);
     }
 
     SmallSet<const SyntaxNode*, 8> enumDecls;
@@ -705,6 +766,12 @@ void Scope::elaborate() const {
                 }
             }
         }
+    }
+
+    // If this is a class type being elaborated, let it inherit members from parent classes.
+    if (thisSym->kind == SymbolKind::ClassType) {
+        thisSym->as<ClassType>().inheritMembers(
+            [this](const Symbol& member) { insertMember(&member, nullptr, true, true); });
     }
 
     auto insertMembers = [this](auto& members, const Symbol* at) {
@@ -740,7 +807,7 @@ void Scope::elaborate() const {
     uint32_t constructIndex = 1;
 
     for (auto symbol : deferred) {
-        LookupLocation location = LookupLocation::before(*symbol);
+        BindContext context(*this, LookupLocation::before(*symbol));
         auto& member = symbol->as<DeferredMemberSymbol>();
 
         switch (member.node.kind) {
@@ -748,8 +815,8 @@ void Scope::elaborate() const {
                 SmallVectorSized<const Symbol*, 8> instances;
                 SmallVectorSized<const Symbol*, 8> implicitNets;
                 InstanceSymbol::fromSyntax(compilation,
-                                           member.node.as<HierarchyInstantiationSyntax>(), location,
-                                           *this, instances, implicitNets);
+                                           member.node.as<HierarchyInstantiationSyntax>(), context,
+                                           instances, implicitNets);
                 insertMembersAndNets(instances, implicitNets, symbol);
                 break;
             }
@@ -757,14 +824,14 @@ void Scope::elaborate() const {
                 SmallVectorSized<const Symbol*, 8> instances;
                 SmallVectorSized<const Symbol*, 8> implicitNets;
                 PrimitiveInstanceSymbol::fromSyntax(member.node.as<PrimitiveInstantiationSyntax>(),
-                                                    location, *this, instances, implicitNets);
+                                                    context, instances, implicitNets);
                 insertMembersAndNets(instances, implicitNets, symbol);
                 break;
             }
             case SyntaxKind::IfGenerate: {
                 SmallVectorSized<GenerateBlockSymbol*, 8> blocks;
                 GenerateBlockSymbol::fromSyntax(compilation, member.node.as<IfGenerateSyntax>(),
-                                                location, *this, constructIndex, true, blocks);
+                                                context, constructIndex, true, blocks);
                 constructIndex++;
                 insertMembers(blocks, symbol);
                 break;
@@ -772,7 +839,7 @@ void Scope::elaborate() const {
             case SyntaxKind::CaseGenerate: {
                 SmallVectorSized<GenerateBlockSymbol*, 8> blocks;
                 GenerateBlockSymbol::fromSyntax(compilation, member.node.as<CaseGenerateSyntax>(),
-                                                location, *this, constructIndex, true, blocks);
+                                                context, constructIndex, true, blocks);
                 constructIndex++;
                 insertMembers(blocks, symbol);
                 break;
@@ -780,7 +847,7 @@ void Scope::elaborate() const {
             case SyntaxKind::LoopGenerate:
                 insertMember(&GenerateBlockArraySymbol::fromSyntax(
                                  compilation, member.node.as<LoopGenerateSyntax>(),
-                                 symbol->getIndex(), location, *this, constructIndex),
+                                 symbol->getIndex(), context, constructIndex),
                              symbol, true, true);
                 constructIndex++;
                 break;
@@ -821,15 +888,15 @@ void Scope::elaborate() const {
                 SmallVectorSized<const Symbol*, 4> symbols;
                 SmallVectorSized<const Symbol*, 8> implicitNets;
                 ContinuousAssignSymbol::fromSyntax(compilation,
-                                                   member.node.as<ContinuousAssignSyntax>(), *this,
-                                                   location, symbols, implicitNets);
+                                                   member.node.as<ContinuousAssignSyntax>(),
+                                                   context, symbols, implicitNets);
                 insertMembersAndNets(symbols, implicitNets, symbol);
                 break;
             }
             case SyntaxKind::ModportDeclaration: {
                 SmallVectorSized<const ModportSymbol*, 4> results;
-                ModportSymbol::fromSyntax(*this, member.node.as<ModportDeclarationSyntax>(),
-                                          location, results);
+                ModportSymbol::fromSyntax(context, member.node.as<ModportDeclarationSyntax>(),
+                                          results);
                 insertMembers(results, symbol);
                 break;
             }
@@ -838,8 +905,8 @@ void Scope::elaborate() const {
                 break;
             case SyntaxKind::UserDefinedNetDeclaration: {
                 SmallVectorSized<const NetSymbol*, 4> results;
-                NetSymbol::fromSyntax(*this, member.node.as<UserDefinedNetDeclarationSyntax>(),
-                                      location, results);
+                NetSymbol::fromSyntax(context, member.node.as<UserDefinedNetDeclarationSyntax>(),
+                                      results);
                 insertMembers(results, symbol);
                 break;
             }
@@ -852,14 +919,13 @@ void Scope::elaborate() const {
             case SyntaxKind::DefaultClockingReference: {
                 // No symbol to create here; instead, try to look up the clocking block
                 // and register it as a default.
-                compilation.noteDefaultClocking(*this, location,
+                compilation.noteDefaultClocking(context,
                                                 member.node.as<DefaultClockingReferenceSyntax>());
                 break;
             }
             case SyntaxKind::DefaultDisableDeclaration: {
                 // No symbol to create here; instead, bind the expression and hand it
                 // off to the compilation for tracking.
-                BindContext context(*this, location);
                 auto& expr = Expression::bind(
                     *member.node.as<DefaultDisableDeclarationSyntax>().expr, context);
 

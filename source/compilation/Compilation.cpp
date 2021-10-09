@@ -25,6 +25,7 @@ namespace slang::Builtins {
 
 void registerArrayMethods(Compilation&);
 void registerConversionFuncs(Compilation&);
+void registerCoverageFuncs(Compilation&);
 void registerEnumMethods(Compilation&);
 void registerMathFuncs(Compilation&);
 void registerMiscSystemFuncs(Compilation&);
@@ -141,6 +142,7 @@ Compilation::Compilation(const Bag& options) :
     // Register all system tasks, functions, and methods.
     Builtins::registerArrayMethods(*this);
     Builtins::registerConversionFuncs(*this);
+    Builtins::registerCoverageFuncs(*this);
     Builtins::registerEnumMethods(*this);
     Builtins::registerMathFuncs(*this);
     Builtins::registerMiscSystemFuncs(*this);
@@ -635,6 +637,21 @@ span<const InstanceSymbol* const> Compilation::getParentInstances(
     return it->second;
 }
 
+void Compilation::notePackageExportCandidate(const PackageSymbol& packageScope,
+                                             const Symbol& symbol) {
+    packageExportCandidateMap[&packageScope][symbol.name] = &symbol;
+}
+
+const Symbol* Compilation::findPackageExportCandidate(const PackageSymbol& packageScope,
+                                                      string_view name) const {
+    if (auto it = packageExportCandidateMap.find(&packageScope);
+        it != packageExportCandidateMap.end()) {
+        if (auto symIt = it->second.find(name); symIt != it->second.end())
+            return symIt->second;
+    }
+    return nullptr;
+}
+
 void Compilation::noteInterfacePort(const Definition& definition) {
     usedIfacePorts.emplace(&definition);
 }
@@ -691,22 +708,22 @@ void Compilation::noteDefaultClocking(const Scope& scope, const Symbol& clocking
     }
 }
 
-void Compilation::noteDefaultClocking(const Scope& scope, LookupLocation location,
+void Compilation::noteDefaultClocking(const BindContext& context,
                                       const DefaultClockingReferenceSyntax& syntax) {
     auto name = syntax.name.valueText();
     auto range = syntax.name.range();
-    auto sym = Lookup::unqualifiedAt(scope, name, location, range);
+    auto sym = Lookup::unqualifiedAt(*context.scope, name, context.getLocation(), range);
     if (!sym)
         return;
 
     if (sym->kind != SymbolKind::ClockingBlock) {
-        auto& diag = scope.addDiag(diag::NotAClockingBlock, range);
+        auto& diag = context.addDiag(diag::NotAClockingBlock, range);
         diag << name;
         diag.addNote(diag::NoteDeclarationHere, sym->location);
         return;
     }
 
-    noteDefaultClocking(scope, *sym, range);
+    noteDefaultClocking(*context.scope, *sym, range);
 }
 
 const Symbol* Compilation::getDefaultClocking(const Scope& scope) const {
@@ -995,20 +1012,26 @@ Diagnostic& Compilation::addDiag(Diagnostic diag) {
     return it->second.back();
 }
 
+void Compilation::forceElaborate(const Symbol& symbol) {
+    DiagnosticVisitor visitor(*this, numErrors,
+                              options.errorLimit == 0 ? UINT32_MAX : options.errorLimit);
+    symbol.visit(visitor);
+}
+
 const Type& Compilation::getType(SyntaxKind typeKind) const {
     auto it = knownTypes.find(typeKind);
     return it == knownTypes.end() ? *errorType : *it->second;
 }
 
-const Type& Compilation::getType(const DataTypeSyntax& node, LookupLocation location,
-                                 const Scope& parent, const Type* typedefTarget) {
-    return Type::fromSyntax(*this, node, location, parent, typedefTarget);
+const Type& Compilation::getType(const DataTypeSyntax& node, const BindContext& context,
+                                 const Type* typedefTarget) {
+    return Type::fromSyntax(*this, node, context, typedefTarget);
 }
 
 const Type& Compilation::getType(const Type& elementType,
                                  const SyntaxList<VariableDimensionSyntax>& dimensions,
-                                 LookupLocation location, const Scope& scope) {
-    return Type::fromSyntax(*this, elementType, dimensions, location, scope);
+                                 const BindContext& context) {
+    return Type::fromSyntax(*this, elementType, dimensions, context);
 }
 
 const Type& Compilation::getType(bitwidth_t width, bitmask<IntegralFlags> flags) {

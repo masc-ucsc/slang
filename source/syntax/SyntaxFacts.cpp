@@ -581,6 +581,25 @@ bool SyntaxFacts::isPossibleArgument(TokenKind kind) {
     switch (kind) {
         case TokenKind::Dot:
         case TokenKind::Comma:
+        case TokenKind::FirstMatchKeyword:
+        case TokenKind::StrongKeyword:
+        case TokenKind::WeakKeyword:
+        case TokenKind::NotKeyword:
+        case TokenKind::IfKeyword:
+        case TokenKind::CaseKeyword:
+        case TokenKind::NextTimeKeyword:
+        case TokenKind::SNextTimeKeyword:
+        case TokenKind::AlwaysKeyword:
+        case TokenKind::SAlwaysKeyword:
+        case TokenKind::EventuallyKeyword:
+        case TokenKind::SEventuallyKeyword:
+        case TokenKind::AcceptOnKeyword:
+        case TokenKind::SyncAcceptOnKeyword:
+        case TokenKind::RejectOnKeyword:
+        case TokenKind::SyncRejectOnKeyword:
+        case TokenKind::EdgeKeyword:
+        case TokenKind::PosEdgeKeyword:
+        case TokenKind::NegEdgeKeyword:
             return true;
         default:
             return isPossibleExpression(kind);
@@ -737,6 +756,10 @@ bool SyntaxFacts::isPossiblePattern(TokenKind kind) {
     }
 }
 
+bool SyntaxFacts::isPossiblePatternOrComma(TokenKind kind) {
+    return kind == TokenKind::Comma || isPossiblePattern(kind);
+}
+
 bool SyntaxFacts::isPossibleDelayOrEventControl(TokenKind kind) {
     switch (kind) {
         case TokenKind::Hash:
@@ -812,7 +835,7 @@ bool SyntaxFacts::isPossiblePortConnection(TokenKind kind) {
         case TokenKind::Comma:
             return true;
         default:
-            return isPossibleExpression(kind);
+            return isPossibleArgument(kind);
     }
 }
 
@@ -1241,6 +1264,7 @@ static bool isModuleCommonDecl(SyntaxKind kind) {
 static bool isModuleCommonItem(SyntaxKind kind) {
     switch (kind) {
         case SyntaxKind::HierarchyInstantiation:
+        case SyntaxKind::CheckerInstantiation:
         case SyntaxKind::ImmediateAssertionMember:
         case SyntaxKind::ConcurrentAssertionMember:
         case SyntaxKind::ContinuousAssign:
@@ -1325,6 +1349,8 @@ bool SyntaxFacts::isAllowedInProgram(SyntaxKind kind) {
         case SyntaxKind::InitialBlock:
         case SyntaxKind::FinalBlock:
         case SyntaxKind::ConcurrentAssertionMember:
+        case SyntaxKind::HierarchyInstantiation:
+        case SyntaxKind::CheckerInstantiation:
         case SyntaxKind::TimeUnitsDeclaration:
         case SyntaxKind::LoopGenerate:
         case SyntaxKind::CaseGenerate:
@@ -1393,8 +1419,11 @@ bool SyntaxFacts::isAllowedInChecker(SyntaxKind kind) {
         case SyntaxKind::ForwardInterfaceClassTypedefDeclaration:
         case SyntaxKind::PackageImportDeclaration:
         case SyntaxKind::DataDeclaration:
-        case SyntaxKind::TaskDeclaration:
+        case SyntaxKind::FunctionDeclaration:
         case SyntaxKind::CheckerDeclaration:
+        case SyntaxKind::CheckerDataDeclaration:
+        case SyntaxKind::HierarchyInstantiation:
+        case SyntaxKind::CheckerInstantiation:
             return true;
         default:
             return false;

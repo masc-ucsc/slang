@@ -6,18 +6,19 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "slang/binding/AssertionExpr.h"
 #include "slang/binding/EvalContext.h"
 #include "slang/binding/Expression.h"
+#include "slang/binding/TimingControl.h"
 #include "slang/symbols/SemanticFacts.h"
 #include "slang/util/Enum.h"
 #include "slang/util/ScopeGuard.h"
 
 namespace slang {
 
-class AssertionExpr;
 class BlockStatement;
+class RandSeqProductionSymbol;
 class StatementBlockSymbol;
-class TimingControl;
 class VariableSymbol;
 struct ForLoopStatementSyntax;
 struct ForeachLoopStatementSyntax;
@@ -52,7 +53,9 @@ struct StatementSyntax;
     x(WaitOrder) \
     x(EventTrigger) \
     x(ProceduralAssign) \
-    x(ProceduralDeassign)
+    x(ProceduralDeassign) \
+    x(RandCase) \
+    x(RandSequence)
 ENUM(StatementKind, STATEMENT);
 #undef STATEMENT
 
@@ -76,12 +79,14 @@ ENUM(CaseStatementCheck, CASE_CHECK)
 enum class StatementFlags {
     None = 0,
     InLoop = 1 << 0,
-    FuncOrFinal = 1 << 1,
-    InForkJoin = 1 << 2,
-    InForkJoinNone = 1 << 3,
-    AutoLifetime = 1 << 4
+    Func = 1 << 1,
+    Final = 1 << 2,
+    InForkJoin = 1 << 3,
+    InForkJoinNone = 1 << 4,
+    AutoLifetime = 1 << 5,
+    InRandSeq = 1 << 6
 };
-BITMASK(StatementFlags, AutoLifetime);
+BITMASK(StatementFlags, InRandSeq);
 
 /// The base class for all statements in SystemVerilog.
 class Statement {
@@ -277,6 +282,8 @@ public:
         blockKind(blockKind), list(&list) {}
 
     const Statement& getStatements() const;
+    bool isNamedBlock() const;
+
     EvalResult evalImpl(EvalContext& context) const;
     bool verifyConstantImpl(EvalContext& context) const;
 
@@ -588,6 +595,11 @@ public:
     static bool isKind(StatementKind kind) { return kind == StatementKind::ForeachLoop; }
 
     template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        arrayRef.visit(visitor);
+    }
+
+    template<typename TVisitor>
     void visitStmts(TVisitor&& visitor) const {
         body.visit(visitor);
     }
@@ -734,6 +746,11 @@ public:
     static bool isKind(StatementKind kind) { return kind == StatementKind::Timed; }
 
     template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        timing.visit(visitor);
+    }
+
+    template<typename TVisitor>
     void visitStmts(TVisitor&& visitor) const {
         stmt.visit(visitor);
     }
@@ -809,11 +826,10 @@ public:
 
     static bool isKind(StatementKind kind) { return kind == StatementKind::ConcurrentAssertion; }
 
-    // TODO:
-    /*template<typename TVisitor>
+    template<typename TVisitor>
     void visitExprs(TVisitor&& visitor) const {
-        cond.visit(visitor);
-    }*/
+        propertySpec.visit(visitor);
+    }
 
     template<typename TVisitor>
     void visitStmts(TVisitor&& visitor) const {
@@ -955,6 +971,8 @@ public:
     template<typename TVisitor>
     void visitExprs(TVisitor&& visitor) const {
         target.visit(visitor);
+        if (timing)
+            timing->visit(visitor);
     }
 };
 
@@ -963,9 +981,11 @@ struct ProceduralAssignStatementSyntax;
 class ProceduralAssignStatement : public Statement {
 public:
     const Expression& assignment;
+    bool isForce;
 
-    ProceduralAssignStatement(const Expression& assignment, SourceRange sourceRange) :
-        Statement(StatementKind::ProceduralAssign, sourceRange), assignment(assignment) {}
+    ProceduralAssignStatement(const Expression& assignment, bool isForce, SourceRange sourceRange) :
+        Statement(StatementKind::ProceduralAssign, sourceRange), assignment(assignment),
+        isForce(isForce) {}
 
     EvalResult evalImpl(EvalContext& context) const;
     bool verifyConstantImpl(EvalContext& context) const;
@@ -989,9 +1009,11 @@ struct ProceduralDeassignStatementSyntax;
 class ProceduralDeassignStatement : public Statement {
 public:
     const Expression& lvalue;
+    bool isRelease;
 
-    ProceduralDeassignStatement(const Expression& lvalue, SourceRange sourceRange) :
-        Statement(StatementKind::ProceduralDeassign, sourceRange), lvalue(lvalue) {}
+    ProceduralDeassignStatement(const Expression& lvalue, bool isRelease, SourceRange sourceRange) :
+        Statement(StatementKind::ProceduralDeassign, sourceRange), lvalue(lvalue),
+        isRelease(isRelease) {}
 
     EvalResult evalImpl(EvalContext& context) const;
     bool verifyConstantImpl(EvalContext& context) const;
@@ -1008,6 +1030,64 @@ public:
     void visitExprs(TVisitor&& visitor) const {
         lvalue.visit(visitor);
     }
+};
+
+struct RandCaseStatementSyntax;
+
+class RandCaseStatement : public Statement {
+public:
+    struct Item {
+        not_null<const Expression*> expr;
+        not_null<const Statement*> stmt;
+    };
+
+    span<Item const> items;
+
+    RandCaseStatement(span<Item const> items, SourceRange sourceRange) :
+        Statement(StatementKind::RandCase, sourceRange), items(items) {}
+
+    EvalResult evalImpl(EvalContext& context) const;
+    bool verifyConstantImpl(EvalContext& context) const;
+
+    static Statement& fromSyntax(Compilation& compilation, const RandCaseStatementSyntax& syntax,
+                                 const BindContext& context, StatementContext& stmtCtx);
+
+    void serializeTo(ASTSerializer& serializer) const;
+
+    static bool isKind(StatementKind kind) { return kind == StatementKind::RandCase; }
+
+    template<typename TVisitor>
+    void visitExprs(TVisitor&& visitor) const {
+        for (auto& item : items)
+            item.expr->visit(visitor);
+    }
+
+    template<typename TVisitor>
+    void visitStmts(TVisitor&& visitor) const {
+        for (auto& item : items)
+            item.stmt->visit(visitor);
+    }
+};
+
+struct RandSequenceStatementSyntax;
+
+class RandSequenceStatement : public Statement {
+public:
+    const RandSeqProductionSymbol* firstProduction;
+
+    RandSequenceStatement(const RandSeqProductionSymbol* firstProduction, SourceRange sourceRange) :
+        Statement(StatementKind::RandSequence, sourceRange), firstProduction(firstProduction) {}
+
+    EvalResult evalImpl(EvalContext& context) const;
+    bool verifyConstantImpl(EvalContext& context) const;
+
+    static Statement& fromSyntax(Compilation& compilation,
+                                 const RandSequenceStatementSyntax& syntax,
+                                 const BindContext& context);
+
+    void serializeTo(ASTSerializer& serializer) const;
+
+    static bool isKind(StatementKind kind) { return kind == StatementKind::RandSequence; }
 };
 
 } // namespace slang

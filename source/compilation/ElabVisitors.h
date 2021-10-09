@@ -46,8 +46,13 @@ struct DiagnosticVisitor : public ASTVisitor<DiagnosticVisitor, false, false> {
                 attr->getValue();
         }
 
-        if constexpr (is_detected_v<getBody_t, T>)
-            symbol.getBody().visit(*this);
+        if constexpr (is_detected_v<getBody_t, T>) {
+            auto& body = symbol.getBody();
+            if (body.bad())
+                return true;
+
+            body.visit(*this);
+        }
 
         visitDefault(symbol);
         return true;
@@ -201,6 +206,34 @@ struct DiagnosticVisitor : public ASTVisitor<DiagnosticVisitor, false, false> {
 
         symbol.getTarget();
         symbol.getValue();
+    }
+
+    void handle(const SequenceSymbol& symbol) {
+        if (!handleDefault(symbol))
+            return;
+
+        symbol.makeDefaultInstance();
+    }
+
+    void handle(const PropertySymbol& symbol) {
+        if (!handleDefault(symbol))
+            return;
+
+        symbol.makeDefaultInstance();
+    }
+
+    void handle(const LetDeclSymbol& symbol) {
+        if (!handleDefault(symbol))
+            return;
+
+        symbol.makeDefaultInstance();
+    }
+
+    void handle(const RandSeqProductionSymbol& symbol) {
+        if (!handleDefault(symbol))
+            return;
+
+        symbol.getRules();
     }
 
     void finalize() {

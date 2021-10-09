@@ -168,11 +168,21 @@ public:
         /// roots of the design.
         flat_hash_set<string_view> globalInstances;
 
-        /// A list of all bind directives parsed.
-        SmallVectorSized<const BindDirectiveSyntax*, 4> bindDirectives;
+        /// A list of all names parsed that could represent a package or class name,
+        /// since they are simple names that appear on the left-hand side of a double colon.
+        SmallVectorSized<const IdentifierNameSyntax*, 4> classPackageNames;
+
+        /// A list of all package import declarations parsed.
+        SmallVectorSized<const PackageImportDeclarationSyntax*, 4> packageImports;
 
         /// A list of all defparams parsed.
         SmallVectorSized<const DefParamSyntax*, 4> defparams;
+
+        /// A list of all class declarations parsed.
+        SmallVectorSized<const ClassDeclarationSyntax*, 4> classDecls;
+
+        /// A list of all bind directives parsed.
+        SmallVectorSized<const BindDirectiveSyntax*, 4> bindDirectives;
     };
 
     /// Gets the current set of metadata collected during parsing.
@@ -198,7 +208,7 @@ private:
     StreamingConcatenationExpressionSyntax& parseStreamConcatenation(Token openBrace);
     StreamExpressionSyntax& parseStreamExpression();
     OpenRangeListSyntax& parseOpenRangeList();
-    ExpressionSyntax& parseOpenRangeElement();
+    ExpressionSyntax& parseOpenRangeElement(bitmask<ExpressionOptions> options = {});
     ElementSelectSyntax& parseElementSelect();
     SelectorSyntax* parseElementSelector();
     NameSyntax& parseName(bitmask<NameOptions> options);
@@ -208,8 +218,10 @@ private:
     ParamAssignmentSyntax& parseParamValue();
     ArgumentSyntax& parseArgument();
     PatternSyntax& parsePattern();
+    StructurePatternMemberSyntax& parseMemberPattern();
     AssignmentPatternExpressionSyntax& parseAssignmentPatternExpression(DataTypeSyntax* type);
     AssignmentPatternItemSyntax& parseAssignmentPatternItem(ExpressionSyntax* key);
+    EventExpressionSyntax& parseSignalEvent();
     EventExpressionSyntax& parseEventExpression();
     NamedBlockClauseSyntax* parseNamedBlockClause();
     TimingControlSyntax* parseTimingControl();
@@ -234,6 +246,7 @@ private:
     StatementSyntax& parseAssertionStatement(NamedLabelSyntax* label, AttrList attributes);
     StatementSyntax& parseVoidCallStatement(NamedLabelSyntax* label, AttrList attributes);
     StatementSyntax& parseRandSequenceStatement(NamedLabelSyntax* label, AttrList attributes);
+    StatementSyntax& parseCheckerStatement(NamedLabelSyntax* label, AttrList attributes);
     ConcurrentAssertionStatementSyntax& parseConcurrentAssertion(NamedLabelSyntax* label, AttrList attributes);
     PropertySpecSyntax& parsePropertySpec();
     ActionBlockSyntax& parseActionBlock();
@@ -275,8 +288,8 @@ private:
     DPIImportSyntax& parseDPIImport(AttrList attributes);
     DPIExportSyntax& parseDPIExport(AttrList attributes);
     ElabSystemTaskSyntax* parseElabSystemTask(AttrList attributes);
-    AssertionItemPortSyntax& parseAssertionItemPort();
-    AssertionItemPortListSyntax* parseAssertionItemPortList();
+    AssertionItemPortSyntax& parseAssertionItemPort(SyntaxKind parentKind);
+    AssertionItemPortListSyntax* parseAssertionItemPortList(SyntaxKind parentKind);
     PropertyDeclarationSyntax& parsePropertyDeclaration(AttrList attributes);
     SequenceDeclarationSyntax& parseSequenceDeclaration(AttrList attributes);
     CheckerDeclarationSyntax& parseCheckerDeclaration(AttrList attributes);
@@ -288,6 +301,8 @@ private:
     MemberSyntax& parseClockingDeclaration(AttrList attributes);
     MemberSyntax& parseDefaultDisable(AttrList attributes);
     MemberSyntax& parseVariableDeclaration(AttrList attributes);
+    DataDeclarationSyntax& parseDataDeclaration(AttrList attributes);
+    LocalVariableDeclarationSyntax& parseLocalVariableDeclaration();
     MemberSyntax& parseNetDeclaration(AttrList attributes);
     DriveStrengthSyntax* parseDriveStrength();
     NetStrengthSyntax* parsePullStrength(Token type);
@@ -295,6 +310,7 @@ private:
     HierarchyInstantiationSyntax& parseHierarchyInstantiation(AttrList attributes);
     HierarchicalInstanceSyntax& parseHierarchicalInstance();
     PrimitiveInstantiationSyntax& parsePrimitiveInstantiation(AttrList attributes);
+    CheckerInstantiationSyntax& parseCheckerInstantiation(AttrList attributes);
     PortConnectionSyntax& parsePortConnection();
     FunctionPortSyntax& parseFunctionPort(bool allowEmptyName);
     FunctionPortListSyntax* parseFunctionPortList(bool allowEmptyNames);
@@ -397,6 +413,7 @@ private:
     bool isPortDeclaration();
     bool isNetDeclaration();
     bool isVariableDeclaration();
+    bool isLocalVariableDeclaration();
     bool isHierarchyInstantiation(bool requireName);
     bool isNonAnsiPort();
     bool isPlainPortName();

@@ -100,29 +100,32 @@ struct DistVarVisitor {
 
     template<typename T>
     void visit(const T& expr) {
-        switch (expr.kind) {
-            case ExpressionKind::NamedValue:
-            case ExpressionKind::HierarchicalValue:
-            case ExpressionKind::MemberAccess:
-            case ExpressionKind::ElementSelect:
-            case ExpressionKind::RangeSelect: {
-                if (auto sym = expr.getSymbolReference()) {
-                    RandMode mode = sym->getRandMode();
-                    if (mode == RandMode::Rand)
-                        anyRandVars = true;
-                    else if (mode == RandMode::RandC)
-                        context.addDiag(diag::RandCInDist, expr.sourceRange);
+        if constexpr (std::is_base_of_v<Expression, T>) {
+            switch (expr.kind) {
+                case ExpressionKind::NamedValue:
+                case ExpressionKind::HierarchicalValue:
+                case ExpressionKind::MemberAccess:
+                case ExpressionKind::ElementSelect:
+                case ExpressionKind::RangeSelect: {
+                    if (auto sym = expr.getSymbolReference()) {
+                        RandMode mode = context.getRandMode(*sym);
+                        if (mode == RandMode::Rand)
+                            anyRandVars = true;
+                        else if (mode == RandMode::RandC)
+                            context.addDiag(diag::RandCInDist, expr.sourceRange);
+                    }
+                    break;
                 }
-                break;
+                default:
+                    if constexpr (is_detected_v<ASTDetectors::visitExprs_t, T, DistVarVisitor>)
+                        expr.visitExprs(*this);
+                    break;
             }
-            default:
-                if constexpr (is_detected_v<ASTDetectors::visitExprs_t, T, DistVarVisitor>)
-                    expr.visitExprs(*this);
-                break;
         }
     }
 
     void visitInvalid(const Expression&) {}
+    void visitInvalid(const AssertionExpr&) {}
 };
 
 struct ConstraintExprVisitor {
@@ -141,88 +144,90 @@ struct ConstraintExprVisitor {
         if (failed)
             return false;
 
-        switch (expr.kind) {
-            case ExpressionKind::Streaming:
-            case ExpressionKind::NewArray:
-            case ExpressionKind::NewClass:
-            case ExpressionKind::CopyClass:
-                context.addDiag(diag::ExprNotConstraint, expr.sourceRange);
-                return visitInvalid(expr);
-            case ExpressionKind::RealLiteral:
-            case ExpressionKind::TimeLiteral:
-                context.addDiag(diag::NonIntegralConstraintLiteral, expr.sourceRange);
-                return visitInvalid(expr);
-            case ExpressionKind::IntegerLiteral:
-                if (expr.template as<IntegerLiteral>().getValue().hasUnknown()) {
-                    context.addDiag(diag::UnknownConstraintLiteral, expr.sourceRange);
+        if constexpr (std::is_base_of_v<Expression, T>) {
+            switch (expr.kind) {
+                case ExpressionKind::Streaming:
+                case ExpressionKind::NewArray:
+                case ExpressionKind::NewClass:
+                case ExpressionKind::CopyClass:
+                    context.addDiag(diag::ExprNotConstraint, expr.sourceRange);
                     return visitInvalid(expr);
-                }
-                return true;
-            case ExpressionKind::UnbasedUnsizedIntegerLiteral:
-                if (expr.template as<UnbasedUnsizedIntegerLiteral>().getValue().hasUnknown()) {
-                    context.addDiag(diag::UnknownConstraintLiteral, expr.sourceRange);
+                case ExpressionKind::RealLiteral:
+                case ExpressionKind::TimeLiteral:
+                    context.addDiag(diag::NonIntegralConstraintLiteral, expr.sourceRange);
                     return visitInvalid(expr);
-                }
-                return true;
-            case ExpressionKind::BinaryOp: {
-                switch (expr.template as<BinaryExpression>().op) {
-                    case BinaryOperator::CaseEquality:
-                    case BinaryOperator::CaseInequality:
-                    case BinaryOperator::WildcardEquality:
-                    case BinaryOperator::WildcardInequality:
-                        context.addDiag(diag::ExprNotConstraint, expr.sourceRange);
+                case ExpressionKind::IntegerLiteral:
+                    if (expr.template as<IntegerLiteral>().getValue().hasUnknown()) {
+                        context.addDiag(diag::UnknownConstraintLiteral, expr.sourceRange);
                         return visitInvalid(expr);
-                    default:
-                        break;
-                }
-                break;
-            }
-            case ExpressionKind::OpenRange:
-                return true;
-            case ExpressionKind::Dist: {
-                // Additional restrictions on dist expressions:
-                // - must contain at least one 'rand' var
-                // - cannot contain any 'randc' vars
-                DistVarVisitor distVisitor(context);
-                auto& left = expr.template as<DistExpression>().left();
-                left.visit(distVisitor);
-                if (!distVisitor.anyRandVars)
-                    context.addDiag(diag::RandNeededInDist, left.sourceRange);
-                return true;
-            }
-            case ExpressionKind::Call: {
-                auto& call = expr.template as<CallExpression>();
-                if (call.getSubroutineKind() == SubroutineKind::Task) {
-                    context.addDiag(diag::TaskInConstraint, expr.sourceRange);
-                    return visitInvalid(expr);
-                }
-
-                if (!call.isSystemCall()) {
-                    const SubroutineSymbol& sub = *std::get<0>(call.subroutine);
-                    for (auto arg : sub.getArguments()) {
-                        if (arg->direction == ArgumentDirection::Out ||
-                            (arg->direction == ArgumentDirection::Ref && !arg->isConstant)) {
-                            context.addDiag(diag::OutRefFuncConstraint, expr.sourceRange);
+                    }
+                    return true;
+                case ExpressionKind::UnbasedUnsizedIntegerLiteral:
+                    if (expr.template as<UnbasedUnsizedIntegerLiteral>().getValue().hasUnknown()) {
+                        context.addDiag(diag::UnknownConstraintLiteral, expr.sourceRange);
+                        return visitInvalid(expr);
+                    }
+                    return true;
+                case ExpressionKind::BinaryOp: {
+                    switch (expr.template as<BinaryExpression>().op) {
+                        case BinaryOperator::CaseEquality:
+                        case BinaryOperator::CaseInequality:
+                        case BinaryOperator::WildcardEquality:
+                        case BinaryOperator::WildcardInequality:
+                            context.addDiag(diag::ExprNotConstraint, expr.sourceRange);
                             return visitInvalid(expr);
+                        default:
+                            break;
+                    }
+                    break;
+                }
+                case ExpressionKind::OpenRange:
+                    return true;
+                case ExpressionKind::Dist: {
+                    // Additional restrictions on dist expressions:
+                    // - must contain at least one 'rand' var
+                    // - cannot contain any 'randc' vars
+                    DistVarVisitor distVisitor(context);
+                    auto& left = expr.template as<DistExpression>().left();
+                    left.visit(distVisitor);
+                    if (!distVisitor.anyRandVars)
+                        context.addDiag(diag::RandNeededInDist, left.sourceRange);
+                    return true;
+                }
+                case ExpressionKind::Call: {
+                    auto& call = expr.template as<CallExpression>();
+                    if (call.getSubroutineKind() == SubroutineKind::Task) {
+                        context.addDiag(diag::TaskInConstraint, expr.sourceRange);
+                        return visitInvalid(expr);
+                    }
+
+                    if (!call.isSystemCall()) {
+                        const SubroutineSymbol& sub = *std::get<0>(call.subroutine);
+                        for (auto arg : sub.getArguments()) {
+                            if (arg->direction == ArgumentDirection::Out ||
+                                (arg->direction == ArgumentDirection::Ref && !arg->isConstant)) {
+                                context.addDiag(diag::OutRefFuncConstraint, expr.sourceRange);
+                                return visitInvalid(expr);
+                            }
                         }
                     }
+                    break;
                 }
-                break;
+                default:
+                    break;
             }
-            default:
-                break;
-        }
 
-        if (!expr.type->isValidForRand(RandMode::Rand)) {
-            context.addDiag(diag::NonIntegralConstraintExpr, expr.sourceRange) << *expr.type;
-            return visitInvalid(expr);
-        }
+            if (!expr.type->isValidForRand(RandMode::Rand)) {
+                context.addDiag(diag::NonIntegralConstraintExpr, expr.sourceRange) << *expr.type;
+                return visitInvalid(expr);
+            }
 
-        if (isSoft) {
-            if (auto sym = expr.getSymbolReference()) {
-                RandMode mode = sym->getRandMode();
-                if (mode == RandMode::RandC)
-                    context.addDiag(diag::RandCInSoft, expr.sourceRange);
+            if (isSoft) {
+                if (auto sym = expr.getSymbolReference()) {
+                    RandMode mode = context.getRandMode(*sym);
+                    if (mode == RandMode::RandC)
+                        context.addDiag(diag::RandCInSoft, expr.sourceRange);
+                }
             }
         }
 
@@ -233,6 +238,8 @@ struct ConstraintExprVisitor {
         failed = true;
         return false;
     }
+
+    bool visitInvalid(const AssertionExpr&) { return false; }
 };
 
 Constraint& ExpressionConstraint::fromSyntax(const ExpressionConstraintSyntax& syntax,
@@ -339,7 +346,7 @@ Constraint& UniquenessConstraint::fromSyntax(const UniquenessConstraintSyntax& s
                 while (symType->isUnpackedArray())
                     symType = symType->getArrayElementType();
 
-                RandMode mode = sym->getRandMode();
+                RandMode mode = context.getRandMode(*sym);
                 if (mode == RandMode::RandC)
                     context.addDiag(diag::RandCInUnique, expr.sourceRange);
                 else if (mode == RandMode::None)
@@ -382,7 +389,7 @@ Constraint& DisableSoftConstraint::fromSyntax(const DisableConstraintSyntax& syn
         return badConstraint(comp, result);
 
     auto sym = expr.getSymbolReference();
-    if (!sym || sym->getRandMode() != RandMode::Rand) {
+    if (!sym || context.getRandMode(*sym) != RandMode::Rand) {
         context.addDiag(diag::BadDisableSoft, expr.sourceRange);
         return badConstraint(comp, result);
     }
@@ -406,9 +413,9 @@ Constraint& SolveBeforeConstraint::fromSyntax(const SolveBeforeConstraintSyntax&
                 bad = true;
             else {
                 auto sym = expr.getSymbolReference();
-                if (!sym || sym->getRandMode() == RandMode::None)
+                if (!sym || context.getRandMode(*sym) == RandMode::None)
                     context.addDiag(diag::BadSolveBefore, expr.sourceRange);
-                else if (sym && sym->getRandMode() == RandMode::RandC)
+                else if (sym && context.getRandMode(*sym) == RandMode::RandC)
                     context.addDiag(diag::RandCInSolveBefore, expr.sourceRange);
             }
         }

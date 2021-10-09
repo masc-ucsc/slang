@@ -6,7 +6,9 @@
 //------------------------------------------------------------------------------
 #include "slang/binding/Statements.h"
 
+#include "slang/binding/CallExpression.h"
 #include "slang/binding/Expression.h"
+#include "slang/binding/SystemSubroutine.h"
 #include "slang/binding/TimingControl.h"
 #include "slang/compilation/Compilation.h"
 #include "slang/diagnostics/ConstEvalDiags.h"
@@ -88,7 +90,8 @@ static bool hasSimpleLabel(const StatementSyntax& syntax) {
     return syntax.kind != SyntaxKind::SequentialBlockStatement &&
            syntax.kind != SyntaxKind::ParallelBlockStatement &&
            syntax.kind != SyntaxKind::ForLoopStatement &&
-           syntax.kind != SyntaxKind::ForeachLoopStatement;
+           syntax.kind != SyntaxKind::ForeachLoopStatement &&
+           syntax.kind != SyntaxKind::RandSequenceStatement;
 }
 
 const Statement& Statement::bind(const StatementSyntax& syntax, const BindContext& context,
@@ -229,16 +232,23 @@ const Statement& Statement::bind(const StatementSyntax& syntax, const BindContex
         case SyntaxKind::AssertPropertyStatement:
         case SyntaxKind::AssumePropertyStatement:
         case SyntaxKind::CoverPropertyStatement:
+        case SyntaxKind::ExpectPropertyStatement:
+        case SyntaxKind::CoverSequenceStatement:
+        case SyntaxKind::RestrictPropertyStatement:
             result = &ConcurrentAssertionStatement::fromSyntax(
                 comp, syntax.as<ConcurrentAssertionStatementSyntax>(), context, stmtCtx);
             break;
         case SyntaxKind::RandCaseStatement:
-        case SyntaxKind::CoverSequenceStatement:
-        case SyntaxKind::RestrictPropertyStatement:
-        case SyntaxKind::ExpectPropertyStatement:
+            result = &RandCaseStatement::fromSyntax(comp, syntax.as<RandCaseStatementSyntax>(),
+                                                    context, stmtCtx);
+            break;
         case SyntaxKind::RandSequenceStatement:
-            context.addDiag(diag::NotYetSupported, syntax.sourceRange());
-            result = &badStmt(comp, nullptr);
+            // We might have an implicit block here; check for that first.
+            result = stmtCtx.tryGetBlock(comp, syntax);
+            if (!result) {
+                result = &RandSequenceStatement::fromSyntax(
+                    comp, syntax.as<RandSequenceStatementSyntax>(), context);
+            }
             break;
         default:
             THROW_UNREACHABLE;
@@ -399,7 +409,10 @@ static void findBlocks(const Scope& scope, const StatementSyntax& syntax,
         }
         case SyntaxKind::AssertPropertyStatement:
         case SyntaxKind::AssumePropertyStatement:
-        case SyntaxKind::CoverPropertyStatement: {
+        case SyntaxKind::CoverPropertyStatement:
+        case SyntaxKind::CoverSequenceStatement:
+        case SyntaxKind::RestrictPropertyStatement:
+        case SyntaxKind::ExpectPropertyStatement: {
             auto& ias = syntax.as<ConcurrentAssertionStatementSyntax>();
             if (ias.action->statement)
                 recurse(ias.action->statement);
@@ -415,11 +428,13 @@ static void findBlocks(const Scope& scope, const StatementSyntax& syntax,
                 recurse(&wos.action->elseClause->clause->as<StatementSyntax>());
             return;
         }
-        case SyntaxKind::CoverSequenceStatement:
-        case SyntaxKind::RestrictPropertyStatement:
-        case SyntaxKind::ExpectPropertyStatement:
         case SyntaxKind::RandSequenceStatement:
-            scope.addDiag(diag::NotYetSupported, syntax.sourceRange());
+            // A randsequence statement always creates a block, but we need to check
+            // labelHandled here to make sure we don't infinitely recurse.
+            if (!labelHandled) {
+                results.append(&StatementBlockSymbol::fromSyntax(
+                    scope, syntax.as<RandSequenceStatementSyntax>()));
+            }
             return;
         default:
             THROW_UNREACHABLE;
@@ -510,8 +525,12 @@ const Statement& StatementBinder::getStatement(const BindContext& context) const
         auto guard = ScopeGuard([this] { isBinding = false; });
 
         BindContext ctx = context;
-        if (flags.has(StatementFlags::FuncOrFinal) && !flags.has(StatementFlags::InForkJoinNone))
-            ctx.flags |= BindFlags::FunctionOrFinal;
+        if (!flags.has(StatementFlags::InForkJoinNone)) {
+            if (flags.has(StatementFlags::Func))
+                ctx.flags |= BindFlags::Function;
+            if (flags.has(StatementFlags::Final))
+                ctx.flags |= BindFlags::Final;
+        }
 
         stmt = &bindStatement(ctx);
     }
@@ -628,7 +647,7 @@ Statement& BlockStatement::fromSyntax(Compilation& compilation, const BlockState
 
     BindContext context = sourceCtx;
     auto blockKind = SemanticFacts::getStatementBlockKind(syntax);
-    if (context.flags.has(BindFlags::FunctionOrFinal)) {
+    if (context.flags.has(BindFlags::Function | BindFlags::Final)) {
         if (blockKind == StatementBlockKind::JoinAll || blockKind == StatementBlockKind::JoinAny) {
             context.addDiag(diag::TimingInFuncNotAllowed, syntax.end.range());
             return badStmt(compilation, nullptr);
@@ -636,7 +655,7 @@ Statement& BlockStatement::fromSyntax(Compilation& compilation, const BlockState
         else if (blockKind == StatementBlockKind::JoinNone) {
             // The "function body" flag does not propagate through fork-join_none
             // blocks, as all statements are allowed in those.
-            context.flags &= ~BindFlags::FunctionOrFinal;
+            context.flags &= ~BindFlags::Function & ~BindFlags::Final;
         }
     }
 
@@ -708,26 +727,27 @@ Statement& ReturnStatement::fromSyntax(Compilation& compilation,
         return badStmt(compilation, nullptr);
     }
 
-    // Find the parent subroutine.
+    // Find the parent subroutine or randsequence production.
     const Scope* scope = context.scope;
     while (scope->asSymbol().kind == SymbolKind::StatementBlock)
         scope = scope->asSymbol().getParentScope();
 
     auto stmtLoc = syntax.returnKeyword.location();
-    if (scope->asSymbol().kind != SymbolKind::Subroutine) {
+    auto& symbol = scope->asSymbol();
+    if (symbol.kind != SymbolKind::Subroutine && symbol.kind != SymbolKind::RandSeqProduction) {
         context.addDiag(diag::ReturnNotInSubroutine, stmtLoc);
         return badStmt(compilation, nullptr);
     }
 
-    auto& subroutine = scope->asSymbol().as<SubroutineSymbol>();
-
+    auto& returnType = symbol.getDeclaredType()->getType();
     const Expression* retExpr = nullptr;
     if (syntax.returnValue) {
-        retExpr = &Expression::bindRValue(subroutine.getReturnType(), *syntax.returnValue, stmtLoc,
-                                          context);
+        retExpr = &Expression::bindRValue(returnType, *syntax.returnValue, stmtLoc, context);
     }
-    else if (!subroutine.getReturnType().isVoid()) {
-        context.addDiag(diag::MissingReturnValue, syntax.sourceRange());
+    else if (!returnType.isVoid()) {
+        DiagCode code = symbol.kind == SymbolKind::Subroutine ? diag::MissingReturnValue
+                                                              : diag::MissingReturnValueProd;
+        context.addDiag(code, syntax.sourceRange());
         return badStmt(compilation, nullptr);
     }
 
@@ -763,7 +783,7 @@ void ReturnStatement::serializeTo(ASTSerializer& serializer) const {
 Statement& BreakStatement::fromSyntax(Compilation& compilation, const JumpStatementSyntax& syntax,
                                       const BindContext& context, StatementContext& stmtCtx) {
     auto result = compilation.emplace<BreakStatement>(syntax.sourceRange());
-    if (!stmtCtx.flags.has(StatementFlags::InLoop)) {
+    if (!stmtCtx.flags.has(StatementFlags::InLoop | StatementFlags::InRandSeq)) {
         context.addDiag(diag::StatementNotInLoop, syntax.sourceRange());
         return badStmt(compilation, result);
     }
@@ -1013,6 +1033,9 @@ Statement& CaseStatement::fromSyntax(Compilation& compilation, const CaseStateme
                 bad |= stmt.bad();
                 break;
             }
+            case SyntaxKind::PatternCaseItem:
+                // TODO: support pattern case statements
+                break;
             case SyntaxKind::DefaultCaseItem:
                 // The parser already errored for duplicate defaults,
                 // so just ignore if it happens here.
@@ -1033,9 +1056,11 @@ Statement& CaseStatement::fromSyntax(Compilation& compilation, const CaseStateme
     bool isInside = syntax.matchesOrInside.kind == TokenKind::InsideKeyword;
     bool wildcard = !isInside && keyword != TokenKind::CaseKeyword;
     bool allowTypeRefs = !isInside && keyword == TokenKind::CaseKeyword;
+    bool allowOpenRange = !wildcard;
 
-    bad |= !Expression::bindMembershipExpressions(context, keyword, wildcard, isInside,
-                                                  allowTypeRefs, *syntax.expr, expressions, bound);
+    bad |=
+        !Expression::bindMembershipExpressions(context, keyword, wildcard, isInside, allowTypeRefs,
+                                               allowOpenRange, *syntax.expr, expressions, bound);
 
     if (isInside && condition != CaseStatementCondition::Normal) {
         context.addDiag(diag::CaseInsideKeyword, syntax.matchesOrInside.range())
@@ -1892,6 +1917,27 @@ void TimedStatement::serializeTo(ASTSerializer& serializer) const {
     serializer.write("stmt", stmt);
 }
 
+static void checkDeferredAssertAction(const Statement& stmt, const BindContext& context) {
+    if (stmt.kind == StatementKind::Empty)
+        return;
+
+    // The statement inside a deferred assertion action block must be a subroutine call.
+    if (stmt.kind != StatementKind::ExpressionStatement ||
+        stmt.as<ExpressionStatement>().expr.kind != ExpressionKind::Call) {
+        context.addDiag(diag::InvalidDeferredAssertAction, stmt.sourceRange);
+        return;
+    }
+
+    // The subroutine being called has some restrictions:
+    // - No output or inout arguments
+    // - If a system call, must be a task
+    // - Any ref arguments cannot reference automatic or dynamic variables
+    auto& call = stmt.as<ExpressionStatement>().expr.as<CallExpression>();
+    AssertionExpr::checkAssertionCall(call, context, diag::DeferredAssertOutArg,
+                                      diag::DeferredAssertAutoRefArg, diag::DeferredAssertSysTask,
+                                      stmt.sourceRange);
+}
+
 Statement& ImmediateAssertionStatement::fromSyntax(Compilation& compilation,
                                                    const ImmediateAssertionStatementSyntax& syntax,
                                                    const BindContext& context,
@@ -1918,12 +1964,19 @@ Statement& ImmediateAssertionStatement::fromSyntax(Compilation& compilation,
     if (isDeferred)
         isFinal = syntax.delay->finalKeyword.valid();
 
-    if (assertKind == AssertionKind::Cover && ifFalse) {
+    bool isCover =
+        assertKind == AssertionKind::CoverProperty || assertKind == AssertionKind::CoverSequence;
+    if (isCover && ifFalse) {
         context.addDiag(diag::CoverStmtNoFail, syntax.action->elseClause->sourceRange());
         bad = true;
     }
 
-    // TODO: add checking for requirements on deferred assertion actions
+    if (isDeferred) {
+        if (ifTrue)
+            checkDeferredAssertAction(*ifTrue, context);
+        if (ifFalse)
+            checkDeferredAssertAction(*ifFalse, context);
+    }
 
     auto result = compilation.emplace<ImmediateAssertionStatement>(
         assertKind, cond, ifTrue, ifFalse, isDeferred, isFinal, syntax.sourceRange());
@@ -1947,7 +2000,9 @@ ER ImmediateAssertionStatement::evalImpl(EvalContext& context) const {
     if (ifFalse)
         return ifFalse->eval(context);
 
-    if (assertionKind == AssertionKind::Cover)
+    bool isCover = assertionKind == AssertionKind::CoverProperty ||
+                   assertionKind == AssertionKind::CoverSequence;
+    if (isCover)
         return ER::Success;
 
     context.addDiag(diag::ConstEvalAssertionFailed, sourceRange);
@@ -1987,23 +2042,36 @@ Statement& ConcurrentAssertionStatement::fromSyntax(
     Compilation& compilation, const ConcurrentAssertionStatementSyntax& syntax,
     const BindContext& context, StatementContext& stmtCtx) {
 
-    // TODO: restrict, cover sequence, other property spec items
+    if (context.flags.has(BindFlags::ConcurrentAssertActionBlock)) {
+        context.addDiag(diag::ConcurrentAssertActionBlock, syntax.sourceRange())
+            << syntax.keyword.valueText();
+        return badStmt(compilation, nullptr);
+    }
+
     AssertionKind assertKind = SemanticFacts::getAssertKind(syntax.kind);
-    auto& prop = AssertionExpr::bind(*syntax.propertySpec->expr, context);
+    auto& prop = AssertionExpr::bind(*syntax.propertySpec, context);
     bool bad = prop.bad();
 
+    BindContext ctx = context.resetFlags(BindFlags::ConcurrentAssertActionBlock);
     const Statement* ifTrue = nullptr;
     const Statement* ifFalse = nullptr;
     if (syntax.action->statement)
-        ifTrue = &Statement::bind(*syntax.action->statement, context, stmtCtx);
+        ifTrue = &Statement::bind(*syntax.action->statement, ctx, stmtCtx);
 
     if (syntax.action->elseClause) {
-        ifFalse = &Statement::bind(syntax.action->elseClause->clause->as<StatementSyntax>(),
-                                   context, stmtCtx);
+        ifFalse = &Statement::bind(syntax.action->elseClause->clause->as<StatementSyntax>(), ctx,
+                                   stmtCtx);
     }
 
-    if (assertKind == AssertionKind::Cover && ifFalse) {
+    bool isCover =
+        assertKind == AssertionKind::CoverProperty || assertKind == AssertionKind::CoverSequence;
+    if (isCover && ifFalse) {
         context.addDiag(diag::CoverStmtNoFail, syntax.action->elseClause->sourceRange());
+        bad = true;
+    }
+    else if (assertKind == AssertionKind::Restrict &&
+             (ifFalse || (ifTrue && ifTrue->kind != StatementKind::Empty))) {
+        context.addDiag(diag::RestrictStmtNoFail, syntax.action->sourceRange());
         bad = true;
     }
 
@@ -2058,7 +2126,7 @@ Statement& WaitStatement::fromSyntax(Compilation& compilation, const WaitStateme
     if (!context.requireBooleanConvertible(cond))
         return badStmt(compilation, result);
 
-    if (context.flags.has(BindFlags::FunctionOrFinal)) {
+    if (context.flags.has(BindFlags::Function | BindFlags::Final)) {
         context.addDiag(diag::TimingInFuncNotAllowed, syntax.sourceRange());
         return badStmt(compilation, result);
     }
@@ -2103,8 +2171,7 @@ Statement& WaitOrderStatement::fromSyntax(Compilation& compilation,
         if (ev.bad())
             return badStmt(compilation, nullptr);
 
-        auto sym = ev.getSymbolReference();
-        if (!sym || !sym->isValue() || !sym->as<ValueSymbol>().getType().isEvent()) {
+        if (!ev.type->isEvent()) {
             context.addDiag(diag::NotAnEvent, name->sourceRange());
             return badStmt(compilation, nullptr);
         }
@@ -2124,7 +2191,7 @@ Statement& WaitOrderStatement::fromSyntax(Compilation& compilation,
 
     auto result = compilation.emplace<WaitOrderStatement>(events.copy(compilation), ifTrue, ifFalse,
                                                           syntax.sourceRange());
-    if (context.flags.has(BindFlags::FunctionOrFinal)) {
+    if (context.flags.has(BindFlags::Function) || context.flags.has(BindFlags::Final)) {
         context.addDiag(diag::TimingInFuncNotAllowed, syntax.sourceRange());
         return badStmt(compilation, result);
     }
@@ -2163,8 +2230,7 @@ Statement& EventTriggerStatement::fromSyntax(Compilation& compilation,
     if (target.bad())
         return badStmt(compilation, nullptr);
 
-    auto sym = target.getSymbolReference();
-    if (!sym || !sym->isValue() || !sym->as<ValueSymbol>().getType().isEvent()) {
+    if (!target.type->isEvent()) {
         context.addDiag(diag::NotAnEvent, syntax.name->sourceRange());
         return badStmt(compilation, nullptr);
     }
@@ -2247,23 +2313,26 @@ static bool isValidForceLVal(const Expression& expr, const BindContext& context,
 Statement& ProceduralAssignStatement::fromSyntax(Compilation& compilation,
                                                  const ProceduralAssignStatementSyntax& syntax,
                                                  const BindContext& context) {
+    bool isForce = syntax.keyword.kind == TokenKind::ForceKeyword;
     auto& assign = Expression::bind(*syntax.expr, context,
                                     BindFlags::NonProcedural | BindFlags::AssignmentAllowed);
-    auto result = compilation.emplace<ProceduralAssignStatement>(assign, syntax.sourceRange());
+
+    auto result =
+        compilation.emplace<ProceduralAssignStatement>(assign, isForce, syntax.sourceRange());
     if (assign.bad())
         return badStmt(compilation, result);
 
     if (assign.kind == ExpressionKind::Assignment) {
         auto& lval = assign.as<AssignmentExpression>().left();
-        if (syntax.keyword.kind == TokenKind::AssignKeyword) {
-            if (!isValidAssignLVal(lval)) {
-                context.addDiag(diag::BadProceduralAssign, lval.sourceRange);
+        if (isForce) {
+            if (!isValidForceLVal(lval, context, false)) {
+                context.addDiag(diag::BadProceduralForce, lval.sourceRange);
                 return badStmt(compilation, result);
             }
         }
         else {
-            if (!isValidForceLVal(lval, context, false)) {
-                context.addDiag(diag::BadProceduralForce, lval.sourceRange);
+            if (!isValidAssignLVal(lval)) {
+                context.addDiag(diag::BadProceduralAssign, lval.sourceRange);
                 return badStmt(compilation, result);
             }
         }
@@ -2283,6 +2352,7 @@ bool ProceduralAssignStatement::verifyConstantImpl(EvalContext& context) const {
 
 void ProceduralAssignStatement::serializeTo(ASTSerializer& serializer) const {
     serializer.write("assignment", assignment);
+    serializer.write("isForce", isForce);
 }
 
 Statement& ProceduralDeassignStatement::fromSyntax(Compilation& compilation,
@@ -2290,22 +2360,25 @@ Statement& ProceduralDeassignStatement::fromSyntax(Compilation& compilation,
                                                    const BindContext& context) {
     BindContext ctx = context.resetFlags(BindFlags::NonProcedural);
     auto& lvalue = Expression::bind(*syntax.variable, ctx);
-    auto result = compilation.emplace<ProceduralDeassignStatement>(lvalue, syntax.sourceRange());
+
+    bool isRelease = syntax.keyword.kind == TokenKind::ReleaseKeyword;
+    auto result =
+        compilation.emplace<ProceduralDeassignStatement>(lvalue, isRelease, syntax.sourceRange());
     if (lvalue.bad())
         return badStmt(compilation, result);
 
     if (!lvalue.verifyAssignable(ctx))
         return badStmt(compilation, result);
 
-    if (syntax.keyword.kind == TokenKind::DeassignKeyword) {
-        if (!isValidAssignLVal(lvalue)) {
-            ctx.addDiag(diag::BadProceduralAssign, lvalue.sourceRange);
+    if (isRelease) {
+        if (!isValidForceLVal(lvalue, ctx, false)) {
+            ctx.addDiag(diag::BadProceduralForce, lvalue.sourceRange);
             return badStmt(compilation, result);
         }
     }
     else {
-        if (!isValidForceLVal(lvalue, ctx, false)) {
-            ctx.addDiag(diag::BadProceduralForce, lvalue.sourceRange);
+        if (!isValidAssignLVal(lvalue)) {
+            ctx.addDiag(diag::BadProceduralAssign, lvalue.sourceRange);
             return badStmt(compilation, result);
         }
     }
@@ -2324,6 +2397,96 @@ bool ProceduralDeassignStatement::verifyConstantImpl(EvalContext& context) const
 
 void ProceduralDeassignStatement::serializeTo(ASTSerializer& serializer) const {
     serializer.write("lvalue", lvalue);
+    serializer.write("isRelease", isRelease);
+}
+
+Statement& RandCaseStatement::fromSyntax(Compilation& compilation,
+                                         const RandCaseStatementSyntax& syntax,
+                                         const BindContext& context, StatementContext& stmtCtx) {
+    bool bad = false;
+    SmallVectorSized<Item, 8> items;
+    for (auto item : syntax.items) {
+        auto& expr = Expression::bind(*item->expr, context);
+        auto& stmt = Statement::bind(*item->statement, context, stmtCtx);
+        items.append({ &expr, &stmt });
+
+        bad |= expr.bad() | stmt.bad();
+        if (!expr.bad() && !expr.type->isIntegral()) {
+            context.addDiag(diag::ExprMustBeIntegral, expr.sourceRange) << *expr.type;
+            bad = true;
+        }
+    }
+
+    auto result =
+        compilation.emplace<RandCaseStatement>(items.copy(compilation), syntax.sourceRange());
+    if (bad)
+        return badStmt(compilation, result);
+
+    return *result;
+}
+
+ER RandCaseStatement::evalImpl(EvalContext&) const {
+    return ER::Fail;
+}
+
+bool RandCaseStatement::verifyConstantImpl(EvalContext& context) const {
+    context.addDiag(diag::ConstEvalRandValue, sourceRange);
+    return false;
+}
+
+void RandCaseStatement::serializeTo(ASTSerializer& serializer) const {
+    serializer.startArray("items");
+    for (auto& item : items) {
+        serializer.startObject();
+        serializer.write("expr", *item.expr);
+        serializer.write("stmt", *item.stmt);
+        serializer.endObject();
+    }
+    serializer.endArray();
+}
+
+Statement& RandSequenceStatement::fromSyntax(Compilation& compilation,
+                                             const RandSequenceStatementSyntax& syntax,
+                                             const BindContext& context) {
+    SourceRange firstProdRange;
+    const RandSeqProductionSymbol* firstProd = nullptr;
+    if (syntax.firstProduction) {
+        firstProdRange = syntax.firstProduction.range();
+        firstProd = RandSeqProductionSymbol::findProduction(syntax.firstProduction.valueText(),
+                                                            firstProdRange, context);
+    }
+    else {
+        auto prodRange = context.scope->membersOfType<RandSeqProductionSymbol>();
+        if (prodRange.begin() != prodRange.end()) {
+            firstProd = &*prodRange.begin();
+            firstProdRange = { syntax.randsequence.location(), syntax.closeParen.range().end() };
+        }
+    }
+
+    if (firstProd) {
+        // Make sure the first production doesn't require arguments.
+        SmallVectorSized<const Expression*, 8> args;
+        CallExpression::bindArgs(nullptr, firstProd->arguments, firstProd->name, firstProdRange,
+                                 context, args);
+    }
+
+    // All of the logic for binding productions is in the RandSeqProduction symbol.
+    auto result = compilation.emplace<RandSequenceStatement>(firstProd, syntax.sourceRange());
+    return *result;
+}
+
+ER RandSequenceStatement::evalImpl(EvalContext&) const {
+    return ER::Fail;
+}
+
+bool RandSequenceStatement::verifyConstantImpl(EvalContext& context) const {
+    context.addDiag(diag::ConstEvalRandValue, sourceRange);
+    return false;
+}
+
+void RandSequenceStatement::serializeTo(ASTSerializer& serializer) const {
+    if (firstProduction)
+        serializer.writeLink("firstProduction", *firstProduction);
 }
 
 } // namespace slang

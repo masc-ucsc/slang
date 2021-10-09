@@ -7,12 +7,14 @@
 #include "slang/binding/SystemSubroutine.h"
 #include "slang/compilation/Compilation.h"
 #include "slang/diagnostics/SysFuncsDiags.h"
+#include "slang/symbols/ASTVisitor.h"
+#include "slang/symbols/MemberSymbols.h"
 
 namespace slang::Builtins {
 
 class FErrorFunc : public SystemSubroutine {
 public:
-    FErrorFunc() : SystemSubroutine("$ferror", SubroutineKind::Function) {}
+    FErrorFunc() : SystemSubroutine("$ferror", SubroutineKind::Function) { hasOutputArgs = true; }
 
     const Type& checkArguments(const BindContext& context, const Args& args, SourceRange range,
                                const Expression*) const final {
@@ -46,7 +48,7 @@ public:
 
 class FGetsFunc : public SystemSubroutine {
 public:
-    FGetsFunc() : SystemSubroutine("$fgets", SubroutineKind::Function) {}
+    FGetsFunc() : SystemSubroutine("$fgets", SubroutineKind::Function) { hasOutputArgs = true; }
 
     const Type& checkArguments(const BindContext& context, const Args& args, SourceRange range,
                                const Expression*) const final {
@@ -82,7 +84,9 @@ class ScanfFunc : public SystemSubroutine {
 public:
     explicit ScanfFunc(bool isFscanf) :
         SystemSubroutine(isFscanf ? "$fscanf" : "$sscanf", SubroutineKind::Function),
-        isFscanf(isFscanf) {}
+        isFscanf(isFscanf) {
+        hasOutputArgs = true;
+    }
 
     const Type& checkArguments(const BindContext& context, const Args& args, SourceRange range,
                                const Expression*) const final {
@@ -128,7 +132,7 @@ private:
 
 class FReadFunc : public SystemSubroutine {
 public:
-    FReadFunc() : SystemSubroutine("$fread", SubroutineKind::Function) {}
+    FReadFunc() : SystemSubroutine("$fread", SubroutineKind::Function) { hasOutputArgs = true; }
 
     bool allowEmptyArgument(size_t argIndex) const final { return argIndex == 2; }
 
@@ -207,7 +211,9 @@ public:
 class DistributionFunc : public SystemSubroutine {
 public:
     DistributionFunc(const std::string& name, size_t numArgs) :
-        SystemSubroutine(name, SubroutineKind::Function), numArgs(numArgs) {}
+        SystemSubroutine(name, SubroutineKind::Function), numArgs(numArgs) {
+        hasOutputArgs = true;
+    }
 
     const Type& checkArguments(const BindContext& context, const Args& args, SourceRange range,
                                const Expression*) const final {
@@ -253,6 +259,9 @@ public:
         if (!checkArgCount(context, false, args, range, 1, 1))
             return comp.getErrorType();
 
+        AssertionExpr::checkSampledValueExpr(*args[0], context, false, diag::SampledValueLocalVar,
+                                             diag::SampledValueMatched);
+
         return *args[0]->type;
     }
 
@@ -282,9 +291,12 @@ public:
         if (!checkArgCount(context, false, args, range, 1, 2))
             return comp.getErrorType();
 
+        AssertionExpr::checkSampledValueExpr(*args[0], context, false, diag::SampledValueLocalVar,
+                                             diag::SampledValueMatched);
+
         // TODO: check rules for inferring clocking
 
-        if (args.size() == 2 && args[1]->kind != ExpressionKind::ClockingArgument)
+        if (args.size() == 2 && args[1]->kind != ExpressionKind::ClockingEvent)
             return badArg(context, *args[1]);
 
         return comp.getBitType();
@@ -321,6 +333,11 @@ public:
         if (!checkArgCount(context, false, args, range, 1, 4))
             return comp.getErrorType();
 
+        for (size_t i = 0; i < args.size() && i < 3; i++) {
+            AssertionExpr::checkSampledValueExpr(
+                *args[i], context, false, diag::SampledValueLocalVar, diag::SampledValueMatched);
+        }
+
         // TODO: check rules for inferring clocking
 
         if (args.size() > 1 && args[1]->kind != ExpressionKind::EmptyArgument) {
@@ -334,7 +351,7 @@ public:
                 return comp.getErrorType();
         }
 
-        if (args.size() > 3 && args[3]->kind != ExpressionKind::ClockingArgument)
+        if (args.size() > 3 && args[3]->kind != ExpressionKind::ClockingEvent)
             return badArg(context, *args[3]);
 
         return *args[0]->type;
@@ -351,8 +368,8 @@ public:
 
 class GlobalValueChangeFunc : public SystemSubroutine {
 public:
-    GlobalValueChangeFunc(const std::string& name, bool) :
-        SystemSubroutine(name, SubroutineKind::Function) {}
+    GlobalValueChangeFunc(const std::string& name, bool isFuture) :
+        SystemSubroutine(name, SubroutineKind::Function), isFuture(isFuture) {}
 
     const Expression& bindArgument(size_t, const BindContext& context,
                                    const ExpressionSyntax& syntax, const Args&) const final {
@@ -370,6 +387,14 @@ public:
             return comp.getErrorType();
         }
 
+        if (!context.flags.has(BindFlags::AssertionExpr) && isFuture) {
+            context.addDiag(diag::GlobalSampledValueAssertionExpr, range);
+            return comp.getErrorType();
+        }
+
+        AssertionExpr::checkSampledValueExpr(*args[0], context, isFuture,
+                                             diag::SampledValueLocalVar, diag::SampledValueMatched);
+
         // TODO: enforce rules for future sampled value functions
 
         return comp.getBitType();
@@ -382,6 +407,9 @@ public:
     bool verifyConstant(EvalContext& context, const Args&, SourceRange range) const final {
         return notConst(context, range);
     }
+
+private:
+    bool isFuture;
 };
 
 void registerNonConstFuncs(Compilation& c) {

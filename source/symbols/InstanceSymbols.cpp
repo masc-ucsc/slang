@@ -8,6 +8,7 @@
 
 #include "ParameterBuilder.h"
 
+#include "slang/binding/AssertionExpr.h"
 #include "slang/binding/Expression.h"
 #include "slang/binding/TimingControl.h"
 #include "slang/compilation/Compilation.h"
@@ -173,7 +174,7 @@ void createImplicitNets(const HierarchicalInstanceSyntax& instance, const BindCo
         return;
 
     for (auto conn : instance.connections) {
-        const ExpressionSyntax* expr = nullptr;
+        const PropertyExprSyntax* expr = nullptr;
         switch (conn->kind) {
             case SyntaxKind::OrderedPortConnection:
                 expr = conn->as<OrderedPortConnectionSyntax>().expr;
@@ -282,11 +283,11 @@ static const ParamOverrideNode* findParentOverrideNode(const Scope& scope) {
 }
 
 void InstanceSymbol::fromSyntax(Compilation& compilation,
-                                const HierarchyInstantiationSyntax& syntax, LookupLocation location,
-                                const Scope& scope, SmallVector<const Symbol*>& results,
+                                const HierarchyInstantiationSyntax& syntax,
+                                const BindContext& context, SmallVector<const Symbol*>& results,
                                 SmallVector<const Symbol*>& implicitNets) {
     // Find our parent instance.
-    auto currScope = &scope;
+    const Scope* currScope = context.scope;
     while (currScope && currScope->asSymbol().kind != SymbolKind::InstanceBody)
         currScope = currScope->asSymbol().getParentScope();
 
@@ -303,26 +304,25 @@ void InstanceSymbol::fromSyntax(Compilation& compilation,
         // generate blocks that might actually be along the parent path for
         // the new instances we're creating.
         if (instanceBody.paramOverrideNode)
-            parentOverrideNode = findParentOverrideNode(scope);
+            parentOverrideNode = findParentOverrideNode(*context.scope);
     }
 
-    auto definition = compilation.getDefinition(syntax.type.valueText(), scope);
+    auto definition = compilation.getDefinition(syntax.type.valueText(), *context.scope);
     if (!definition) {
         // This might actually be a user-defined primitive instantiation.
         if (auto prim = compilation.getPrimitive(syntax.type.valueText())) {
-            PrimitiveInstanceSymbol::fromSyntax(*prim, syntax, location, scope, results,
-                                                implicitNets);
+            PrimitiveInstanceSymbol::fromSyntax(*prim, syntax, context, results, implicitNets);
             if (!results.empty() &&
                 (!owningDefinition || owningDefinition->definitionKind != DefinitionKind::Module)) {
-                scope.addDiag(diag::InvalidPrimInstanceForParent, syntax.type.range());
+                context.addDiag(diag::InvalidPrimInstanceForParent, syntax.type.range());
             }
         }
         else {
             if (!isUninstantiated)
-                scope.addDiag(diag::UnknownModule, syntax.type.range()) << syntax.type.valueText();
+                context.addDiag(diag::UnknownModule, syntax.type.range())
+                    << syntax.type.valueText();
 
-            UnknownModuleSymbol::fromSyntax(compilation, syntax, location, scope, results,
-                                            implicitNets);
+            UnknownModuleSymbol::fromSyntax(compilation, syntax, context, results, implicitNets);
         }
         return;
     }
@@ -332,21 +332,20 @@ void InstanceSymbol::fromSyntax(Compilation& compilation,
         if (owningKind == DefinitionKind::Program ||
             (owningKind == DefinitionKind::Interface &&
              definition->definitionKind == DefinitionKind::Module)) {
-            scope.addDiag(diag::InvalidInstanceForParent, syntax.type.range())
+            context.addDiag(diag::InvalidInstanceForParent, syntax.type.range())
                 << definition->getArticleKindString() << owningDefinition->getArticleKindString();
         }
     }
 
     // We have to check each port connection expression for any names that can't be resolved,
     // which represent implicit nets that need to be created now.
-    BindContext context(scope, location);
     SmallSet<string_view, 8> implicitNetNames;
-    auto& netType = scope.getDefaultNetType();
+    auto& netType = context.scope->getDefaultNetType();
 
     // The common case is that our parent doesn't have a parameter override node,
     // which lets us evaluate all parameter assignments for this instance in a batch.
     if (!parentOverrideNode) {
-        ParameterBuilder paramBuilder(scope, definition->name, definition->parameters);
+        ParameterBuilder paramBuilder(*context.scope, definition->name, definition->parameters);
         if (syntax.parameters)
             paramBuilder.setAssignments(*syntax.parameters);
 
@@ -354,7 +353,7 @@ void InstanceSymbol::fromSyntax(Compilation& compilation,
         // shared between instances, and so that we can use them to create
         // a cache key to lookup any instance bodies that may already be
         // suitable for the new instances we're about to create.
-        createParams(compilation, *definition, paramBuilder, location,
+        createParams(compilation, *definition, paramBuilder, context.getLocation(),
                      syntax.getFirstToken().location(), isUninstantiated);
 
         InstanceCacheKey cacheKey(*definition, paramBuilder.paramValues.copy(compilation),
@@ -383,7 +382,7 @@ void InstanceSymbol::fromSyntax(Compilation& compilation,
                 }
             }
 
-            ParameterBuilder paramBuilder(scope, definition->name, definition->parameters);
+            ParameterBuilder paramBuilder(*context.scope, definition->name, definition->parameters);
             if (syntax.parameters)
                 paramBuilder.setAssignments(*syntax.parameters);
             if (overrideNode)
@@ -393,7 +392,7 @@ void InstanceSymbol::fromSyntax(Compilation& compilation,
             // shared between instances, and so that we can use them to create
             // a cache key to lookup any instance bodies that may already be
             // suitable for the new instances we're about to create.
-            createParams(compilation, *definition, paramBuilder, location,
+            createParams(compilation, *definition, paramBuilder, context.getLocation(),
                          syntax.getFirstToken().location(), isUninstantiated);
 
             InstanceCacheKey cacheKey(*definition, paramBuilder.paramValues.copy(compilation),
@@ -410,7 +409,6 @@ void InstanceSymbol::fromSyntax(Compilation& compilation,
 
 void InstanceSymbol::fromBindDirective(const Scope& scope, const BindDirectiveSyntax& syntax) {
     auto& comp = scope.getCompilation();
-    BindContext context(scope, LookupLocation::max);
     const Definition* targetDef = nullptr;
 
     // TODO: check results of noteBindDirective
@@ -418,8 +416,8 @@ void InstanceSymbol::fromBindDirective(const Scope& scope, const BindDirectiveSy
     auto createInstances = [&](const Scope& targetScope) {
         SmallVectorSized<const Symbol*, 4> instances;
         SmallVectorSized<const Symbol*, 4> implicitNets;
-        fromSyntax(comp, *syntax.instantiation, LookupLocation::max, targetScope, instances,
-                   implicitNets);
+        BindContext ctx(targetScope, LookupLocation::max);
+        fromSyntax(comp, *syntax.instantiation, ctx, instances, implicitNets);
 
         // If instances is an empty array, an error must have occurred and we should
         // not attempt creating more instances later.
@@ -442,6 +440,7 @@ void InstanceSymbol::fromBindDirective(const Scope& scope, const BindDirectiveSy
     // If an instance list is given, then the target name must be a definition name.
     // Otherwise, the target name can be either an instance name or a definition name,
     // preferencing the instance if found.
+    BindContext context(scope, LookupLocation::max);
     if (syntax.targetInstances) {
         comp.noteBindDirective(syntax, nullptr);
 
@@ -618,15 +617,15 @@ const InstanceBodySymbol& InstanceBodySymbol::fromDefinition(
 }
 
 const InstanceBodySymbol* InstanceBodySymbol::fromDefinition(
-    const Scope& scope, LookupLocation lookupLocation, SourceLocation sourceLoc,
-    const Definition& definition, const ParameterValueAssignmentSyntax* parameterSyntax) {
+    const BindContext& context, SourceLocation sourceLoc, const Definition& definition,
+    const ParameterValueAssignmentSyntax* parameterSyntax) {
 
-    ParameterBuilder paramBuilder(scope, definition.name, definition.parameters);
+    ParameterBuilder paramBuilder(*context.scope, definition.name, definition.parameters);
     if (parameterSyntax)
         paramBuilder.setAssignments(*parameterSyntax);
 
-    auto& comp = scope.getCompilation();
-    if (!createParams(comp, definition, paramBuilder, lookupLocation, sourceLoc,
+    auto& comp = context.getCompilation();
+    if (!createParams(comp, definition, paramBuilder, context.getLocation(), sourceLoc,
                       /* isUninstantiated */ false)) {
         return nullptr;
     }
@@ -772,11 +771,11 @@ static void createUnknownModules(Compilation& compilation, const TSyntax& syntax
 
 void UnknownModuleSymbol::fromSyntax(Compilation& compilation,
                                      const HierarchyInstantiationSyntax& syntax,
-                                     LookupLocation location, const Scope& scope,
+                                     const BindContext& parentContext,
                                      SmallVector<const Symbol*>& results,
                                      SmallVector<const Symbol*>& implicitNets) {
     SmallVectorSized<const Expression*, 8> params;
-    BindContext context(scope, location, BindFlags::NonProcedural);
+    BindContext context = parentContext.resetFlags(BindFlags::NonProcedural);
 
     if (syntax.parameters) {
         for (auto expr : syntax.parameters->parameters) {
@@ -798,15 +797,15 @@ void UnknownModuleSymbol::fromSyntax(Compilation& compilation,
 
 void UnknownModuleSymbol::fromSyntax(Compilation& compilation,
                                      const PrimitiveInstantiationSyntax& syntax,
-                                     LookupLocation location, const Scope& scope,
+                                     const BindContext& parentContext,
                                      SmallVector<const Symbol*>& results,
                                      SmallVector<const Symbol*>& implicitNets) {
-    BindContext context(scope, location, BindFlags::NonProcedural);
+    BindContext context = parentContext.resetFlags(BindFlags::NonProcedural);
     createUnknownModules(compilation, syntax, syntax.type.valueText(), context, {}, results,
                          implicitNets);
 }
 
-span<const Expression* const> UnknownModuleSymbol::getPortConnections() const {
+span<const AssertionExpr* const> UnknownModuleSymbol::getPortConnections() const {
     if (!ports) {
         auto syntax = getSyntax();
         auto scope = getParentScope();
@@ -815,25 +814,33 @@ span<const Expression* const> UnknownModuleSymbol::getPortConnections() const {
         auto& comp = scope->getCompilation();
         BindContext context(*scope, LookupLocation::after(*this));
 
-        SmallVectorSized<const Expression*, 8> results;
+        SmallVectorSized<const AssertionExpr*, 8> results;
         SmallVectorSized<string_view, 8> names;
         for (auto port : syntax->as<HierarchicalInstanceSyntax>().connections) {
             if (port->kind == SyntaxKind::OrderedPortConnection) {
                 names.append(""sv);
                 results.append(
-                    &Expression::bind(*port->as<OrderedPortConnectionSyntax>().expr, context));
+                    &AssertionExpr::bind(*port->as<OrderedPortConnectionSyntax>().expr, context));
             }
             else if (port->kind == SyntaxKind::NamedPortConnection) {
                 auto& npc = port->as<NamedPortConnectionSyntax>();
                 names.append(npc.name.valueText());
 
                 if (auto ex = npc.expr)
-                    results.append(&Expression::bind(*ex, context));
+                    results.append(&AssertionExpr::bind(*ex, context));
             }
         }
 
         ports = results.copy(comp);
         portNames = names.copy(comp);
+
+        for (auto port : *ports) {
+            if (port->kind != AssertionExprKind::Simple ||
+                port->as<SimpleAssertionExpr>().repetition) {
+                mustBeChecker = true;
+                break;
+            }
+        }
     }
     return *ports;
 }
@@ -862,7 +869,13 @@ void UnknownModuleSymbol::serializeTo(ASTSerializer& serializer) const {
         if (!names[i].empty())
             serializer.write("name", names[i]);
 
-        serializer.write("expr", *conns[i]);
+        if (mustBeChecker) {
+            serializer.write("expr", *conns[i]);
+        }
+        else {
+            serializer.write("expr", conns[i]->as<SimpleAssertionExpr>().expr);
+        }
+
         serializer.endObject();
     }
     serializer.endArray();
@@ -930,22 +943,22 @@ Symbol* recursePrimArray(Compilation& compilation, const PrimitiveSymbol& primit
 
 template<typename TSyntax>
 void createPrimitives(const PrimitiveSymbol& primitive, const TSyntax& syntax,
-                      LookupLocation location, const Scope& scope,
-                      SmallVector<const Symbol*>& results,
+                      const BindContext& parentContext, SmallVector<const Symbol*>& results,
                       SmallVector<const Symbol*>& implicitNets) {
     SmallSet<string_view, 8> implicitNetNames;
     SmallVectorSized<int32_t, 4> path;
-    auto& comp = scope.getCompilation();
-    auto& netType = scope.getDefaultNetType();
 
-    BindContext context(scope, location, BindFlags::Constant);
+    BindContext context = parentContext.resetFlags(BindFlags::Constant);
+    auto& comp = context.getCompilation();
+    auto& netType = context.scope->getDefaultNetType();
+
     for (auto instance : syntax.instances) {
         path.clear();
         createImplicitNets(*instance, context, netType, implicitNetNames, implicitNets);
 
         if (!instance->decl) {
-            results.append(
-                createPrimInst(comp, scope, primitive, *instance, syntax.attributes, path));
+            results.append(createPrimInst(comp, *context.scope, primitive, *instance,
+                                          syntax.attributes, path));
         }
         else {
             auto dims = instance->decl->dimensions;
@@ -960,17 +973,17 @@ void createPrimitives(const PrimitiveSymbol& primitive, const TSyntax& syntax,
 
 void PrimitiveInstanceSymbol::fromSyntax(const PrimitiveSymbol& primitive,
                                          const HierarchyInstantiationSyntax& syntax,
-                                         LookupLocation location, const Scope& scope,
+                                         const BindContext& context,
                                          SmallVector<const Symbol*>& results,
                                          SmallVector<const Symbol*>& implicitNets) {
-    createPrimitives(primitive, syntax, location, scope, results, implicitNets);
+    createPrimitives(primitive, syntax, context, results, implicitNets);
 }
 
 void PrimitiveInstanceSymbol::fromSyntax(const PrimitiveInstantiationSyntax& syntax,
-                                         LookupLocation location, const Scope& scope,
+                                         const BindContext& context,
                                          SmallVector<const Symbol*>& results,
                                          SmallVector<const Symbol*>& implicitNets) {
-    auto& comp = scope.getCompilation();
+    auto& comp = context.getCompilation();
     auto name = syntax.type.valueText();
     auto prim = syntax.type.kind == TokenKind::Identifier ? comp.getPrimitive(name)
                                                           : comp.getGateType(name);
@@ -978,19 +991,19 @@ void PrimitiveInstanceSymbol::fromSyntax(const PrimitiveInstantiationSyntax& syn
     if (!prim) {
         // See if there is a definition with this name, which indicates an error
         // in providing a drive strength or net delay.
-        if (comp.getDefinition(name, scope)) {
+        if (comp.getDefinition(name, *context.scope)) {
             ASSERT(syntax.strength || syntax.delay);
             if (syntax.strength) {
-                scope.addDiag(diag::InstanceWithStrength, syntax.strength->sourceRange()) << name;
+                context.addDiag(diag::InstanceWithStrength, syntax.strength->sourceRange()) << name;
             }
             else {
-                scope.addDiag(diag::InstanceWithDelay,
-                              syntax.delay->getFirstToken().location() + 1);
+                context.addDiag(diag::InstanceWithDelay,
+                                syntax.delay->getFirstToken().location() + 1);
             }
         }
         else {
             // Find our parent instance to see if it is uninstantiated.
-            auto currScope = &scope;
+            const Scope* currScope = context.scope;
             while (currScope && currScope->asSymbol().kind != SymbolKind::InstanceBody)
                 currScope = currScope->asSymbol().getParentScope();
 
@@ -998,14 +1011,14 @@ void PrimitiveInstanceSymbol::fromSyntax(const PrimitiveInstantiationSyntax& syn
                 currScope && currScope->asSymbol().as<InstanceBodySymbol>().isUninstantiated;
 
             if (!isUninstantiated)
-                scope.addDiag(diag::UnknownPrimitive, syntax.type.range()) << name;
+                context.addDiag(diag::UnknownPrimitive, syntax.type.range()) << name;
         }
 
-        UnknownModuleSymbol::fromSyntax(comp, syntax, location, scope, results, implicitNets);
+        UnknownModuleSymbol::fromSyntax(comp, syntax, context, results, implicitNets);
         return;
     }
 
-    createPrimitives(*prim, syntax, location, scope, results, implicitNets);
+    createPrimitives(*prim, syntax, context, results, implicitNets);
 }
 
 span<const Expression* const> PrimitiveInstanceSymbol::getPortConnections() const {
@@ -1021,8 +1034,16 @@ span<const Expression* const> PrimitiveInstanceSymbol::getPortConnections() cons
         SmallVectorSized<const ExpressionSyntax*, 8> conns;
         auto& his = syntax->as<HierarchicalInstanceSyntax>();
         for (auto port : his.connections) {
-            if (port->kind == SyntaxKind::OrderedPortConnection)
-                conns.append(port->as<OrderedPortConnectionSyntax>().expr);
+            if (port->kind == SyntaxKind::OrderedPortConnection) {
+                auto expr =
+                    context.requireSimpleExpr(*port->as<OrderedPortConnectionSyntax>().expr);
+                if (!expr) {
+                    ports.emplace();
+                    return *ports;
+                }
+
+                conns.append(expr);
+            }
             else if (port->kind != SyntaxKind::EmptyPortConnection ||
                      primitiveType.primitiveKind != PrimitiveSymbol::UserDefined) {
                 context.addDiag(diag::InvalidPrimitivePortConn, port->sourceRange());

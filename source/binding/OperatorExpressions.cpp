@@ -157,8 +157,8 @@ const Type* Expression::binaryOperatorType(Compilation& compilation, const Type*
 }
 
 bool Expression::bindMembershipExpressions(const BindContext& context, TokenKind keyword,
-                                           bool wildcard, bool unwrapUnpacked,
-                                           bool allowTypeReferences,
+                                           bool requireIntegral, bool unwrapUnpacked,
+                                           bool allowTypeReferences, bool allowOpenRange,
                                            const ExpressionSyntax& valueExpr,
                                            span<const ExpressionSyntax* const> expressions,
                                            SmallVector<const Expression*>& results) {
@@ -171,7 +171,7 @@ bool Expression::bindMembershipExpressions(const BindContext& context, TokenKind
     bool bad = valueRes.bad();
     bool canBeStrings = valueRes.isImplicitString();
 
-    if ((!wildcard && type->isAggregate()) || (wildcard && !type->isIntegral())) {
+    if ((!requireIntegral && type->isAggregate()) || (requireIntegral && !type->isIntegral())) {
         if (!bad) {
             context.addDiag(diag::BadSetMembershipType, valueRes.sourceRange)
                 << *type << LexerFacts::getTokenKindText(keyword);
@@ -226,11 +226,20 @@ bool Expression::bindMembershipExpressions(const BindContext& context, TokenKind
         if (bad)
             continue;
 
-        if (canBeStrings && !bound->isImplicitString())
-            canBeStrings = false;
+        // Special handling for open range expressions -- they don't have
+        // a real type on their own, we need to check their bounds.
+        if (allowOpenRange && bound->kind == ExpressionKind::OpenRange) {
+            if (canBeStrings && !bound->isImplicitString())
+                canBeStrings = false;
+
+            auto& range = bound->as<OpenRangeExpression>();
+            checkType(range.left(), *range.left().type);
+            checkType(range.right(), *range.right().type);
+            continue;
+        }
 
         const Type* bt = bound->type;
-        if (wildcard) {
+        if (requireIntegral) {
             if (!bt->isIntegral()) {
                 context.addDiag(diag::BadSetMembershipType, bound->sourceRange)
                     << *bt << LexerFacts::getTokenKindText(keyword);
@@ -242,21 +251,15 @@ bool Expression::bindMembershipExpressions(const BindContext& context, TokenKind
             continue;
         }
 
-        // Special handling for open range expressions -- they don't have
-        // a real type on their own, we need to check their bounds.
-        if (bound->kind == ExpressionKind::OpenRange) {
-            auto& range = bound->as<OpenRangeExpression>();
-            checkType(range.left(), *range.left().type);
-            checkType(range.right(), *range.right().type);
-            continue;
-        }
-
         // If this is an "inside" operation, then unpacked arrays are unwrapped
         // into their element types before checking further.
         if (unwrapUnpacked) {
             while (bt->isUnpackedArray())
                 bt = bt->getArrayElementType();
         }
+
+        if (canBeStrings && !bound->isImplicitString() && !bt->isString())
+            canBeStrings = false;
 
         checkType(*bound, *bt);
     }
@@ -289,11 +292,15 @@ bool Expression::bindMembershipExpressions(const BindContext& context, TokenKind
 Expression& UnaryExpression::fromSyntax(Compilation& compilation,
                                         const PrefixUnaryExpressionSyntax& syntax,
                                         const BindContext& context) {
-    Expression& operand = create(compilation, *syntax.operand, context);
+    auto op = getUnaryOperator(syntax.kind);
+    bitmask<BindFlags> extraFlags;
+    if (isLValueOp(op))
+        extraFlags = BindFlags::LValue;
+
+    Expression& operand = create(compilation, *syntax.operand, context, extraFlags);
     const Type* type = operand.type;
 
-    auto result = compilation.emplace<UnaryExpression>(getUnaryOperator(syntax.kind), *type,
-                                                       operand, syntax.sourceRange());
+    auto result = compilation.emplace<UnaryExpression>(op, *type, operand, syntax.sourceRange());
     if (operand.bad())
         return badExpr(compilation, result);
 
@@ -367,11 +374,11 @@ Expression& UnaryExpression::fromSyntax(Compilation& compilation,
 Expression& UnaryExpression::fromSyntax(Compilation& compilation,
                                         const PostfixUnaryExpressionSyntax& syntax,
                                         const BindContext& context) {
-    Expression& operand = create(compilation, *syntax.operand, context);
-    const Type* type = operand.type;
-
     // This method is only ever called for postincrement and postdecrement operators, so
     // the operand must be an lvalue.
+    Expression& operand = create(compilation, *syntax.operand, context, BindFlags::LValue);
+    const Type* type = operand.type;
+
     Expression* result = compilation.emplace<UnaryExpression>(getUnaryOperator(syntax.kind), *type,
                                                               operand, syntax.sourceRange());
     if (operand.bad() || !operand.verifyAssignable(context, syntax.operatorToken.location()))
@@ -562,7 +569,7 @@ Expression& BinaryExpression::fromSyntax(Compilation& compilation,
     // If we are allowed unbounded literals here, pass that along to subexpressions.
     bitmask<BindFlags> flags = BindFlags::None;
     if (context.flags.has(BindFlags::AllowUnboundedLiteral) &&
-        !context.flags.has(BindFlags::AssertionExpr)) {
+        context.flags.has(BindFlags::AllowUnboundedLiteralArithmetic)) {
         flags = BindFlags::AllowUnboundedLiteral;
     }
 
@@ -744,7 +751,7 @@ Expression& BinaryExpression::fromComponents(Expression& lhs, Expression& rhs, B
                     contextDetermined(context, result->left_, compilation.getStringType());
                     contextDetermined(context, result->right_, compilation.getStringType());
                 }
-                else if (lt->isAggregate() && lt->isEquivalent(*rt)) {
+                else if (lt->isAggregate() && lt->isEquivalent(*rt) && !lt->isUnpackedUnion()) {
                     good = !isWildcard;
                     result->type = singleBitType(compilation, lt, rt);
                 }
@@ -940,7 +947,7 @@ Expression& ConditionalExpression::fromSyntax(Compilation& compilation,
 
     // Pass through the flag allowing unbounded literals.
     if (context.flags.has(BindFlags::AllowUnboundedLiteral) &&
-        !context.flags.has(BindFlags::AssertionExpr)) {
+        context.flags.has(BindFlags::AllowUnboundedLiteralArithmetic)) {
         leftFlags |= BindFlags::AllowUnboundedLiteral;
         rightFlags |= BindFlags::AllowUnboundedLiteral;
     }
@@ -990,7 +997,7 @@ Expression& ConditionalExpression::fromSyntax(Compilation& compilation,
             else
                 good = false;
         }
-        else if (lt->isEquivalent(*rt)) {
+        else if (lt->isEquivalent(*rt) && !lt->isUnpackedUnion()) {
             result->type = lt;
         }
         else if (left.isImplicitString() && right.isImplicitString()) {
@@ -1066,8 +1073,7 @@ ConstantValue ConditionalExpression::evalImpl(EvalContext& context) const {
             // Sizes here might differ for dynamic arrays.
             span<const ConstantValue> la = cvl.elements();
             span<const ConstantValue> ra = cvr.elements();
-            if (la.size() == ra.size()) {
-                // TODO: what if this is an unpacked struct?
+            if (la.size() == ra.size() && type->isArray()) {
                 std::vector<ConstantValue> result(la.size());
                 return combineArrays(result, la, ra);
             }
@@ -1110,9 +1116,9 @@ Expression& InsideExpression::fromSyntax(Compilation& compilation,
 
     SmallVectorSized<const Expression*, 8> bound;
     bool bad =
-        !bindMembershipExpressions(context, TokenKind::InsideKeyword, /* wildcard */ false,
+        !bindMembershipExpressions(context, TokenKind::InsideKeyword, /* requireIntegral */ false,
                                    /* unwrapUnpacked */ true, /* allowTypeReferences */ false,
-                                   *syntax.expr, expressions, bound);
+                                   /* allowOpenRange */ true, *syntax.expr, expressions, bound);
 
     auto boundSpan = bound.copy(compilation);
     auto result = compilation.emplace<InsideExpression>(compilation.getLogicType(), *boundSpan[0],
@@ -1789,10 +1795,16 @@ Expression& StreamingConcatenationExpression::fromSyntax(
             return badExpr(compilation, badResult());
 
         if (argSyntax->expression->kind != SyntaxKind::StreamingConcatenationExpression) {
-            // TODO: first-declared member of untagged union
-            const Type& type = *arg->type;
-            if (!type.isBitstreamType(!assignmentTarget)) {
-                context.addDiag(diag::BadStreamExprType, arg->sourceRange) << type;
+            const Type* type = arg->type;
+            if (type->isUnpackedUnion() && !type->isTaggedUnion()) {
+                auto& uu = type->getCanonicalType().as<UnpackedUnionType>();
+                auto members = uu.members();
+                if (members.begin() != members.end())
+                    type = &members.begin()->as<ValueSymbol>().getType();
+            }
+
+            if (!type->isBitstreamType(!assignmentTarget)) {
+                context.addDiag(diag::BadStreamExprType, arg->sourceRange) << *arg->type;
                 return badExpr(compilation, badResult());
             }
         }
@@ -1895,6 +1907,12 @@ size_t StreamingConcatenationExpression::bitstreamWidth() const {
         else if (stream->with) {
             size_t count = stream->with->width ? static_cast<size_t>(*stream->with->width) : 1;
             width += count * operand.type->getArrayElementType()->bitstreamWidth();
+        }
+        else if (operand.type->isUnpackedUnion()) {
+            auto& uu = operand.type->getCanonicalType().as<UnpackedUnionType>();
+            auto members = uu.members();
+            if (members.begin() != members.end())
+                width += members.begin()->as<ValueSymbol>().getType().bitstreamWidth();
         }
         else {
             width += operand.type->bitstreamWidth();

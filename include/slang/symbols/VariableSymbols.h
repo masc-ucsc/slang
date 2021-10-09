@@ -52,6 +52,7 @@ public:
             case SymbolKind::ClassProperty:
             case SymbolKind::Iterator:
             case SymbolKind::ClockVar:
+            case SymbolKind::LocalAssertionVar:
                 return true;
             default:
                 return false;
@@ -129,8 +130,9 @@ public:
     static void fromSyntax(const Scope& scope, const NetDeclarationSyntax& syntax,
                            SmallVector<const NetSymbol*>& results);
 
-    static void fromSyntax(const Scope& scope, const UserDefinedNetDeclarationSyntax& syntax,
-                           LookupLocation location, SmallVector<const NetSymbol*>& results);
+    static void fromSyntax(const BindContext& context,
+                           const UserDefinedNetDeclarationSyntax& syntax,
+                           SmallVector<const NetSymbol*>& results);
 
     static bool isKind(SymbolKind kind) { return kind == SymbolKind::Net; }
 
@@ -177,6 +179,20 @@ public:
     void serializeTo(ASTSerializer& serializer) const;
 
     static bool isKind(SymbolKind kind) { return kind == SymbolKind::ClockVar; }
+};
+
+struct LocalVariableDeclarationSyntax;
+
+/// Represents a local variable declared inside an assertion item,
+/// such as a sequence or property.
+class LocalAssertionVarSymbol : public VariableSymbol {
+public:
+    LocalAssertionVarSymbol(string_view name, SourceLocation loc);
+
+    static void fromSyntax(const Scope& scope, const LocalVariableDeclarationSyntax& syntax,
+                           SmallVector<const LocalAssertionVarSymbol*>& results);
+
+    static bool isKind(SymbolKind kind) { return kind == SymbolKind::LocalAssertionVar; }
 };
 
 } // namespace slang

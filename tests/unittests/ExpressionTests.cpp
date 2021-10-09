@@ -336,8 +336,14 @@ TEST_CASE("Expression types") {
     // Min-typ-max
     CHECK(typeof("(arr1[99]:3'd4:99'd4) + 2'd1") == "bit[2:0]");
 
+    // Unpacked unions
+    declare("union { int i; real r; } uu1, uu2;");
+    CHECK(typeof("uu1 == uu2") == "<error>");
+    CHECK(typeof("uu1 !== uu2") == "<error>");
+    CHECK(typeof("1 ? uu1 : uu2") == "<error>");
+
     auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 8);
+    REQUIRE(diags.size() == 11);
     CHECK(diags[0].code == diag::BadUnaryExpression);
     CHECK(diags[1].code == diag::BadBinaryExpression);
     CHECK(diags[2].code == diag::BadBinaryExpression);
@@ -346,6 +352,9 @@ TEST_CASE("Expression types") {
     CHECK(diags[5].code == diag::BadBinaryExpression);
     CHECK(diags[6].code == diag::BadConditionalExpression);
     CHECK(diags[7].code == diag::NotBooleanConvertible);
+    CHECK(diags[8].code == diag::BadBinaryExpression);
+    CHECK(diags[9].code == diag::BadBinaryExpression);
+    CHECK(diags[10].code == diag::BadConditionalExpression);
 }
 
 TEST_CASE("Expression - bad name references") {
@@ -896,6 +905,10 @@ module m;
 
         func.k = 4; // ok, param is static
     end
+
+    final begin
+        i <= 5;
+    end
 endmodule
 )");
 
@@ -903,7 +916,7 @@ endmodule
     compilation.addSyntaxTree(tree);
 
     auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 7);
+    REQUIRE(diags.size() == 8);
     CHECK(diags[0].code == diag::ConstEvalNonConstVariable);
     CHECK(diags[1].code == diag::AssignmentNotAllowed);
     CHECK(diags[2].code == diag::AssignmentRequiresParens);
@@ -911,6 +924,7 @@ endmodule
     CHECK(diags[4].code == diag::IncDecNotAllowed);
     CHECK(diags[5].code == diag::IncDecNotAllowed);
     CHECK(diags[6].code == diag::AutoFromStaticInit);
+    CHECK(diags[7].code == diag::NonblockingInFinal);
 }
 
 TEST_CASE("Assignment error checking") {
@@ -2048,6 +2062,10 @@ endmodule
 TEST_CASE("Unbounded queue access") {
     auto tree = SyntaxTree::fromText(R"(
 module m;
+    parameter int u = $;
+    parameter v = $;
+    parameter w = $+1;
+
     int q[$] = { 2, 4, 8 };
     int e, pos;
     initial begin
@@ -2060,11 +2078,13 @@ module m;
         q = { q[0:pos], e, q[pos+1:$] };
         q = q[2:$];
         q = q[1:$-1'b1];
-        q = q[1:e ? $+1 : $-1];
+        q = q[1:e ? u+1 : v-1];
 
         // These are disallowed.
         e = $;
         q[-$] = 1;
+        e = u;
+        e = v;
     end
 endmodule
 )");
@@ -2073,9 +2093,12 @@ endmodule
     compilation.addSyntaxTree(tree);
 
     auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 2);
+    REQUIRE(diags.size() == 5);
     CHECK(diags[0].code == diag::UnboundedNotAllowed);
     CHECK(diags[1].code == diag::UnboundedNotAllowed);
+    CHECK(diags[2].code == diag::UnboundedNotAllowed);
+    CHECK(diags[3].code == diag::UnboundedNotAllowed);
+    CHECK(diags[4].code == diag::UnboundedNotAllowed);
 }
 
 TEST_CASE("Selects with negative bounds") {
@@ -2193,4 +2216,241 @@ endmodule
     Compilation compilation;
     compilation.addSyntaxTree(tree);
     NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Invalid specparam regress GH #417") {
+    auto tree = SyntaxTree::fromText(R"(
+specparam[] asasa = 1;
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    // Just check no assertion.
+    compilation.getAllDiagnostics();
+}
+
+TEST_CASE("Invalid argument regress GH #418") {
+    auto tree = SyntaxTree::fromText(R"(
+byte i_data [ ] ;
+initial
+i_data [ 12 : 9
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    // Just check no assertion.
+    compilation.getAllDiagnostics();
+}
+
+TEST_CASE("Invalid param assign regress GH #420") {
+    auto tree = SyntaxTree::fromText(R"(
+typedef ctrl_reg_t;
+parameter CTRL_RESET = $;
+endpackage
+module shadow # (
+  RESVAL
+endmodule;
+shadow # (CTRL_RESET) (
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    // Just check no assertion.
+    compilation.getAllDiagnostics();
+}
+
+TEST_CASE("Tagged union expressions") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    union tagged { int a; int b[]; void c; } foo;
+    initial begin
+        foo = tagged a 1;
+        foo = tagged b '{1,2};
+        foo = tagged c;
+    end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Tagged union expression errors") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    union tagged { int a; int b[]; void c; } foo;
+    initial begin
+        static int i = 1 + tagged a;
+
+        foo = tagged baz 1;
+        foo = tagged b;
+        foo = tagged c 52;
+    end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 4);
+    CHECK(diags[0].code == diag::TaggedUnionTarget);
+    CHECK(diags[1].code == diag::UnknownMember);
+    CHECK(diags[2].code == diag::TaggedUnionMissingInit);
+    CHECK(diags[3].code == diag::BadAssignment);
+}
+
+TEST_CASE("Assignment pattern expressions") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    // Simple patterns, different target types
+    struct packed { int a; logic [3:0] b; } a = '{9000, 13};
+    struct { int a; real b; } b = '{1, 3.14};
+    logic [3:1][2:5] c = '{3'd2, 3'd5, 3'd6};
+    real d[2:5] = '{1.1, 1.2, 1.3, 1.4};
+    int e[] = '{0:1, 1:2, 2:3};
+    int f[*] = '{1:1, 2:2, 3:3};
+    int g[$] = '{3 {1}};
+    enum logic[1:0] { A, B } h = '{1, 0};
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Assignment pattern errors") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    event e1 = event'{1};
+    parameter p = '{1, 2};
+
+    typedef event e_t;
+    e_t e2 = '{1};
+
+    int a[int] = '{1, 2};
+
+    typedef real rt;
+    typedef struct { int a; rt b; } st;
+    st b = '{1};
+    int c[1:2] = '{1};
+    st d = '{default:1, default:2, a:1, a:2, rt:3.14, blah:3, event:1, (1+1):2};
+
+    int e[] = '{0:1, 0:2, default:1, int:3, -1:2};
+    int f[1:2] = '{default:1, default:2, event:1, 9:1};
+    int g[] = '{1:1};
+
+    st h = '{-1{0}};
+    st i = '{3{1}};
+    int j[1:2] = '{-1{0}};
+    int k[] = '{-1{0}};
+
+    int l[int] = '{default:1, default:2, 3:1, 3:2, int:1};
+
+    int m[2][2] = '{real:3.14};
+    struct { int i; real r; } n[2] = '{real:3.14};
+    
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 28);
+    CHECK(diags[0].code == diag::BadAssignmentPatternType);
+    CHECK(diags[1].code == diag::AssignmentPatternNoContext);
+    CHECK(diags[2].code == diag::BadAssignmentPatternType);
+    CHECK(diags[3].code == diag::AssignmentPatternAssociativeType);
+    CHECK(diags[4].code == diag::WrongNumberAssignmentPatterns);
+    CHECK(diags[5].code == diag::WrongNumberAssignmentPatterns);
+    CHECK(diags[6].code == diag::AssignmentPatternKeyDupDefault);
+    CHECK(diags[7].code == diag::AssignmentPatternKeyDupName);
+    CHECK(diags[8].code == diag::UnknownMember);
+    CHECK(diags[9].code == diag::AssignmentPatternKeyExpr);
+    CHECK(diags[10].code == diag::AssignmentPatternKeyExpr);
+    CHECK(diags[11].code == diag::AssignmentPatternKeyDupValue);
+    CHECK(diags[12].code == diag::AssignmentPatternDynamicDefault);
+    CHECK(diags[13].code == diag::AssignmentPatternDynamicType);
+    CHECK(diags[14].code == diag::ValueMustBePositive);
+    CHECK(diags[15].code == diag::AssignmentPatternKeyDupDefault);
+    CHECK(diags[16].code == diag::AssignmentPatternKeyExpr);
+    CHECK(diags[17].code == diag::IndexValueInvalid);
+    CHECK(diags[18].code == diag::AssignmentPatternMissingElements);
+    CHECK(diags[19].code == diag::ValueMustBePositive);
+    CHECK(diags[20].code == diag::WrongNumberAssignmentPatterns);
+    CHECK(diags[21].code == diag::ValueMustBePositive);
+    CHECK(diags[22].code == diag::ValueMustBePositive);
+    CHECK(diags[23].code == diag::AssignmentPatternKeyDupDefault);
+    CHECK(diags[24].code == diag::AssignmentPatternKeyDupValue);
+    CHECK(diags[25].code == diag::AssignmentPatternDynamicType);
+    CHECK(diags[26].code == diag::AssignmentPatternMissingElements);
+    CHECK(diags[27].code == diag::AssignmentPatternNoMember);
+}
+
+TEST_CASE("Set membership type checking regress GH #450") {
+    auto tree = SyntaxTree::fromText(R"(
+string val;
+function compare(string attr[$]);
+    if (val inside {attr}) begin
+    end
+endfunction
+function compare_singular(string attr1, string attr2);
+    if (val inside {attr1, attr2}) begin
+    end
+endfunction
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Assignment assertion regress GH #456") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    enum { A, B } foo;
+    int bar;
+    initial begin
+        case (bar)
+            A: begin end
+        endcase
+    end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Binary expression regress GH #457") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    wire a;
+    always @((a) && (a)) begin end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Expression lookup regress GH #470") {
+    auto tree = SyntaxTree::fromText(R"(
+typedef logic [$ clog2:0] clearing_lfsr_perm_t;
+function aes_sb_out_mask_prd_concat;
+sb_out_mask_prd [ $ clog2 () ' ( RomSize ) ] ;
+endfunction
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    compilation.getAllDiagnostics();
 }

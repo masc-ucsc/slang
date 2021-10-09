@@ -747,6 +747,69 @@ TEST_CASE("Unpacked struct eval") {
     CHECK_THAT(session.eval("foo == foo").integer(), exactlyEquals(SVInt(logic_t::x)));
     CHECK(session.eval("foo === foo").integer() == 1);
 
+    session.eval("var type(foo) bar;");
+    CHECK(session.eval("foo === bar").integer() == 0);
+    CHECK(session.eval("(1 ? foo : bar) === foo").integer() == 1);
+    CHECK(session.eval("('x ? foo : bar) === bar").integer() == 1);
+
+    NO_SESSION_ERRORS;
+}
+
+TEST_CASE("Unpacked union eval") {
+    ScriptSession session;
+    session.eval("union { integer a[2:0]; bit b; } foo, bar;");
+    session.eval("foo.a[0] = 42;");
+    session.eval("foo.b = 1;");
+
+    CHECK(session.eval("foo").toString() == "(1) 1'b1");
+
+    session.eval("foo.a[0] = 42;");
+    session.eval("foo.a[2:1] = '{3,4};");
+    CHECK(session.eval("foo").toString() == "(0) [3,4,42]");
+
+    session.eval("bar = foo;");
+    CHECK(session.eval("bar").toString() == "(0) [3,4,42]");
+
+    // Accessing wrong member just gets you the default.
+    CHECK(session.eval("foo.b").integer() == 0);
+
+    // Inspecting common initial sequence across values is allowed.
+    session.eval(R"(
+union {
+    struct {
+        int s1;
+        struct {
+            int n1;
+            real n2;
+        } s2;
+    } a;
+    struct {
+        struct {
+            int v;
+        } s1;
+        int s2;
+        int s3;
+    } b;
+    int c;
+} baz;
+)");
+
+    session.eval("baz.a = '{42, '{55, 3.14}};");
+    CHECK(session.eval("baz.a.s1").integer() == 42);
+    CHECK(session.eval("baz.b.s1.v").integer() == 42);
+    CHECK(session.eval("baz.b.s2").integer() == 55);
+    CHECK(session.eval("baz.b.s3").integer() == 0);
+    CHECK(session.eval("baz.c").integer() == 42);
+
+    session.eval("baz.b = '{'{1}, 2, 3};");
+    CHECK(session.eval("baz.a.s1").integer() == 1);
+    CHECK(session.eval("baz.a.s2.n1").integer() == 2);
+    CHECK(session.eval("baz.a.s2.n2").real() == 0.0);
+    CHECK(session.eval("baz.c").integer() == 1);
+
+    session.eval("baz.c = 123;");
+    CHECK(session.eval("baz.a.s1").integer() == 123);
+
     NO_SESSION_ERRORS;
 }
 
@@ -1448,17 +1511,17 @@ TEST_CASE("Real conversion functions") {
 TEST_CASE("Real math functions") {
     ScriptSession session;
 
-    CHECK(session.eval("$ln(123.456)").real() == log(123.456));
-    CHECK(session.eval("$log10(123.456)").real() == log10(123.456));
-    CHECK(session.eval("$exp(123.456)").real() == exp(123.456));
-    CHECK(session.eval("$sqrt(123.456)").real() == sqrt(123.456));
-    CHECK(session.eval("$floor(123.456)").real() == floor(123.456));
-    CHECK(session.eval("$ceil(123.456)").real() == ceil(123.456));
-    CHECK(session.eval("$sin(123.456)").real() == sin(123.456));
-    CHECK(session.eval("$cos(123.456)").real() == cos(123.456));
-    CHECK(session.eval("$tan(123.456)").real() == tan(123.456));
-    CHECK(session.eval("$asin(0.456)").real() == asin(0.456));
-    CHECK(session.eval("$acos(0.456)").real() == acos(0.456));
+    CHECK(session.eval("$ln(123.456)").real() == Approx(log(123.456)));
+    CHECK(session.eval("$log10(123.456)").real() == Approx(log10(123.456)));
+    CHECK(session.eval("$exp(123.456)").real() == Approx(exp(123.456)));
+    CHECK(session.eval("$sqrt(123.456)").real() == Approx(sqrt(123.456)));
+    CHECK(session.eval("$floor(123.456)").real() == Approx(floor(123.456)));
+    CHECK(session.eval("$ceil(123.456)").real() == Approx(ceil(123.456)));
+    CHECK(session.eval("$sin(123.456)").real() == Approx(sin(123.456)));
+    CHECK(session.eval("$cos(123.456)").real() == Approx(cos(123.456)));
+    CHECK(session.eval("$tan(123.456)").real() == Approx(tan(123.456)));
+    CHECK(session.eval("$asin(0.456)").real() == Approx(asin(0.456)));
+    CHECK(session.eval("$acos(0.456)").real() == Approx(acos(0.456)));
     CHECK(session.eval("$atan(0.456)").real() == Approx(atan(0.456)));
     CHECK(session.eval("$sinh(0.456)").real() == Approx(sinh(0.456)));
     CHECK(session.eval("$cosh(0.456)").real() == Approx(cosh(0.456)));
@@ -1467,9 +1530,9 @@ TEST_CASE("Real math functions") {
     CHECK(session.eval("$acosh(123.456)").real() == Approx(acosh(123.456)));
     CHECK(session.eval("$atanh(0.456)").real() == Approx(atanh(0.456)));
 
-    CHECK(session.eval("$pow(2.1, 1.456)").real() == pow(2.1, 1.456));
-    CHECK(session.eval("$atan2(2.1, 1.456)").real() == atan2(2.1, 1.456));
-    CHECK(session.eval("$hypot(2.1, 1.456)").real() == hypot(2.1, 1.456));
+    CHECK(session.eval("$pow(2.1, 1.456)").real() == Approx(pow(2.1, 1.456)));
+    CHECK(session.eval("$atan2(2.1, 1.456)").real() == Approx(atan2(2.1, 1.456)));
+    CHECK(session.eval("$hypot(2.1, 1.456)").real() == Approx(hypot(2.1, 1.456)));
 
     NO_SESSION_ERRORS;
 }
@@ -1667,6 +1730,7 @@ struct { time a; enum bit [0:1] {red, yellow, blue} b; } record;
 localparam bit dynamic[] = '{1, 0};
 localparam shortint queue[$] = '{8, 1, 3};
 localparam byte asso[string] = '{ "Jon": 20, "Paul":22, "Al":23, default:-1 };
+union { int i[4]; bit [18:0] j; } u;
 )");
 
     CHECK(session.eval("$bits(str)").integer() == 40);
@@ -1677,6 +1741,7 @@ localparam byte asso[string] = '{ "Jon": 20, "Paul":22, "Al":23, default:-1 };
     CHECK(session.eval("$bits(asso)").integer() == 24);
     CHECK(session.eval("$bits(\"abcefghijk\")").integer() == 80);
     CHECK(session.eval("$bits(0)").integer() == 32);
+    CHECK(session.eval("$bits(u)").integer() == 128);
 
     NO_SESSION_ERRORS;
 }
@@ -1838,7 +1903,26 @@ typedef struct {
     bit [3:0] addr;
     bit [3:0] data;
 } packet_t;
-localparam packet_t value2  = {<<4{ {<<2{array2}} }};
+localparam packet_t value2 = {<<4{ {<<2{array2}} }};
+
+typedef union {
+    byte b;
+    logic[63:0] r;
+} u_t;
+
+function u_t f;
+    f.b = 8'b10011100;
+endfunction
+
+function u_t g;
+    g.r = 123456789;
+endfunction
+
+localparam u_t value3 = f();
+localparam logic[7:0] value4 = {<<4{ {<<2{value3}} }};
+
+localparam u_t value5 = g();
+localparam logic[7:0] value6 = {<<4{ {<<2{value5}} }};
 )");
 
     CHECK(session.eval("s0").integer() == session.eval("{\"A\", \"B\", \"C\", \"D\"}").integer());
@@ -1865,9 +1949,12 @@ localparam packet_t value2  = {<<4{ {<<2{array2}} }};
     CHECK(value2.elements()[0].integer() == "4'b0110"_si);
     CHECK(value2.elements()[1].integer() == "4'b0011"_si);
 
+    CHECK(session.eval("value4").integer() == "8'b01100011"_si);
+
     auto diags = session.getDiagnostics();
-    REQUIRE(diags.size() == 1);
+    REQUIRE(diags.size() == 2);
     CHECK(diags[0].code == diag::IgnoredSlice);
+    CHECK(diags[1].code == diag::BadStreamSize);
 }
 
 TEST_CASE("streaming operator target evaluation") {
@@ -2066,7 +2153,7 @@ TEST_CASE("Array ordering methods") {
     session.eval("d.reverse");
 
     CHECK(session.eval("c").toString() == "[3,4,9,1]");
-    CHECK(session.eval("d").toString() == "[bar,baz,asdf]");
+    CHECK(session.eval("d").toString() == "[\"bar\",\"baz\",\"asdf\"]");
 
     NO_SESSION_ERRORS;
 }
@@ -2081,7 +2168,7 @@ TEST_CASE("Array locator methods") {
     CHECK(session.eval("a.find with (item > 7)").toString() == "[9,8,8]");
     CHECK(session.eval("b.find_index with (item < 0)").toString() == "[2,3,4]");
     CHECK(session.eval("c.find_first with (item == 4)").toString() == "[4]");
-    CHECK(session.eval("c.find_first_index with (item == 4)").toString() == "[good]");
+    CHECK(session.eval("c.find_first_index with (item == 4)").toString() == "[\"good\"]");
     CHECK(session.eval("c.find_last with (item < 100)").toString() == "[1]");
     CHECK(session.eval("b.find_last_index with (item > 10)").toString() == "[]");
     CHECK(session.eval("a.find_last_index with (item == 8)").toString() == "[5]");
@@ -2099,8 +2186,8 @@ TEST_CASE("Array locator methods") {
     CHECK(session.eval("e.unique_index with (item == 4 ? 1 : item)").toString() == "[0,3,4,6]");
 
     session.eval("int f[string] = '{\"a\":1, \"b\":5, \"c\":1, \"d\":1};");
-    CHECK(session.eval("f.unique_index").toString() == "[a,b]");
-    CHECK(session.eval("f.unique_index with (item == 5 ? 1 : item)").toString() == "[a]");
+    CHECK(session.eval("f.unique_index").toString() == "[\"a\",\"b\"]");
+    CHECK(session.eval("f.unique_index with (item == 5 ? 1 : item)").toString() == "[\"a\"]");
 
     NO_SESSION_ERRORS;
 }
@@ -2121,6 +2208,17 @@ TEST_CASE("Queue unbounded expressions") {
 
     session.eval("q[$+1] = -1;");
     CHECK(session.eval("q").toString() == "[3,6,4,-1]");
+
+    session.eval("parameter int p1 = $;");
+    session.eval("parameter p2 = $;");
+    CHECK(session.eval("q[p1]").integer() == -1);
+    CHECK(session.eval("q[p2-1]").integer() == 4);
+
+    CHECK(session.eval("$isunbounded($)").integer() == 1);
+    CHECK(session.eval("$isunbounded(p1)").integer() == 1);
+    CHECK(session.eval("$isunbounded(p2)").integer() == 1);
+    CHECK(session.eval("$isunbounded(0)").integer() == 0);
+    CHECK(session.eval("$isunbounded(3.14)").integer() == 0);
 
     NO_SESSION_ERRORS;
 }
@@ -2154,4 +2252,88 @@ TEST_CASE("Assignment type propagation regression") {
     CHECK(session.eval("foo = a + b").integer() == 253);
 
     NO_SESSION_ERRORS;
+}
+
+TEST_CASE("Tagged union eval") {
+    ScriptSession session;
+
+    session.eval("union tagged { int a; real b; } u;");
+    CHECK(session.eval("u").toString() == "(unset)");
+
+    session.eval("u = tagged b 3.14;");
+    CHECK(session.eval("u").toString() == "(1) 3.14");
+    session.eval("u.a");
+    session.eval("u.a = 1;");
+
+    session.eval("union tagged packed { byte a; byte unsigned b; } v;");
+    CHECK(session.eval("v").toString() == "9'h0");
+
+    session.eval("v = tagged b 200;");
+    CHECK(session.eval("v").toString() == "9'h1c8");
+    CHECK(session.eval("v.b").integer() == 200);
+    CHECK(session.eval("v.b = 5").integer() == 5);
+    session.eval("v.a");
+    session.eval("v.a = 1;");
+
+    session.eval("v = tagged a -1;");
+    CHECK(session.eval("v.a").integer().as<int8_t>() == -1);
+
+    CHECK(session.eval("$bits(v)").integer() == 9);
+    CHECK(session.eval("$bits(u)").integer() == 64);
+
+    session.eval("union tagged { int a[]; real b; } w;");
+    session.eval("w = tagged a '{1, 2, 3, 4}");
+    CHECK(session.eval("$bits(w)").integer() == 128);
+
+    auto diags = session.getDiagnostics();
+    REQUIRE(diags.size() == 4);
+    CHECK(diags[0].code == diag::ConstEvalTaggedUnion);
+    CHECK(diags[1].code == diag::ConstEvalTaggedUnion);
+    CHECK(diags[2].code == diag::ConstEvalTaggedUnion);
+    CHECK(diags[3].code == diag::ConstEvalTaggedUnion);
+}
+
+TEST_CASE("Assignment pattern eval") {
+    ScriptSession session;
+    session.eval("typedef logic[7:0] bt;");
+    session.eval("bt foo[4:3][1:2] = '{bt: 3};");
+
+    CHECK(session.eval("foo").toString() == "[[8'h3,8'h3],[8'h3,8'h3]]");
+
+    session.eval(R"(
+struct {
+    int a[1:0];
+    time t;
+    logic[6:1] l;
+    union packed { int i; } u;
+    struct { real r; } r[2];
+} bar[1:2][4:3] = '{int:1, time:2, real:3.14, default:2};)");
+
+    CHECK(session.eval("bar").toString() == "[[[[1,1],64'h2,6'b10,32'd2,[[3.14],[3.14]]],"
+                                            "[[1,1],64'h2,6'b10,32'd2,[[3.14],[3.14]]]],"
+                                            "[[[1,1],64'h2,6'b10,32'd2,[[3.14],[3.14]]],"
+                                            "[[1,1],64'h2,6'b10,32'd2,[[3.14],[3.14]]]]]");
+
+    NO_SESSION_ERRORS;
+}
+
+TEST_CASE("foreach loop extended name eval") {
+    ScriptSession session;
+    session.eval("typedef int rt[2][2];");
+    session.eval(R"(
+function rt f;
+    rt array;
+    initial begin
+        foreach (array[i]) begin
+            foreach (array[i][j]) begin
+                array[i][j] = (i + 1) * (j + 1);
+            end
+        end
+    end
+    return array;
+endfunction
+)");
+
+    auto cv = session.eval("f();");
+    CHECK(cv.toString() == "[[1,2],[2,4]]");
 }

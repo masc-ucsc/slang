@@ -186,7 +186,9 @@ public:
 
 class StringOutputTask : public SystemTaskBase {
 public:
-    using SystemTaskBase::SystemTaskBase;
+    explicit StringOutputTask(const std::string& name) : SystemTaskBase(name) {
+        hasOutputArgs = true;
+    }
 
     bool allowEmptyArgument(size_t index) const final { return index != 0; }
 
@@ -214,7 +216,9 @@ public:
 
 class StringFormatTask : public SystemTaskBase {
 public:
-    using SystemTaskBase::SystemTaskBase;
+    explicit StringFormatTask(const std::string& name) : SystemTaskBase(name) {
+        hasOutputArgs = true;
+    }
 
     const Type& checkArguments(const BindContext& context, const Args& args, SourceRange range,
                                const Expression*) const final {
@@ -243,7 +247,9 @@ public:
 class ReadWriteMemTask : public SystemTaskBase {
 public:
     ReadWriteMemTask(const std::string& name, bool isInput) :
-        SystemTaskBase(name), isInput(isInput) {}
+        SystemTaskBase(name), isInput(isInput) {
+        hasOutputArgs = isInput;
+    }
 
     const Type& checkArguments(const BindContext& context, const Args& args, SourceRange range,
                                const Expression*) const final {
@@ -438,7 +444,7 @@ public:
 
 class CastTask : public SystemTaskBase {
 public:
-    using SystemTaskBase::SystemTaskBase;
+    explicit CastTask(const std::string& name) : SystemTaskBase(name) { hasOutputArgs = true; }
 
     const Type& checkArguments(const BindContext& context, const Args& args, SourceRange range,
                                const Expression*) const final {
@@ -455,6 +461,9 @@ public:
             context.addDiag(diag::CastArgSingular, args[1]->sourceRange) << *args[1]->type;
             return comp.getErrorType();
         }
+
+        if (!args[0]->verifyAssignable(context))
+            return comp.getErrorType();
 
         return comp.getIntType();
     }
@@ -512,7 +521,9 @@ public:
     StochasticTask(const std::string& name, SubroutineKind subroutineKind, size_t inputArgs,
                    size_t outputArgs) :
         SystemSubroutine(name, subroutineKind),
-        inputArgs(inputArgs), outputArgs(outputArgs) {}
+        inputArgs(inputArgs), outputArgs(outputArgs) {
+        hasOutputArgs = outputArgs > 0;
+    }
 
     const Type& checkArguments(const BindContext& context, const Args& args, SourceRange range,
                                const Expression*) const final {
@@ -594,6 +605,60 @@ public:
         }
 
         return comp.getVoidType();
+    }
+};
+
+class PlaTask : public SystemTaskBase {
+public:
+    PlaTask(const std::string& name) : SystemTaskBase(name){};
+
+    const Type& checkArguments(const BindContext& context, const Args& args, SourceRange range,
+                               const Expression*) const final {
+        auto& comp = context.getCompilation();
+
+        if (!checkArgCount(context, false, args, range, 3, 3))
+            return comp.getErrorType();
+
+        for (size_t i = 0; i < args.size(); i++) {
+            auto& type = *args[i]->type;
+
+            if (i == 0) {
+                if (!type.isUnpackedArray()) {
+                    return badArg(context, *args[i]);
+                }
+
+                auto& elemType = *type.getArrayElementType();
+                if (!elemType.isSimpleBitVector() || elemType.isPredefinedInteger()) {
+                    return badArg(context, *args[i]);
+                }
+
+                if (elemType.hasFixedRange() && !isValidRange(elemType)) {
+                    return badRange(context, *args[i]);
+                }
+            }
+            else {
+                if (!type.isSimpleBitVector() || type.isPredefinedInteger()) {
+                    return badArg(context, *args[i]);
+                }
+            }
+
+            if (type.hasFixedRange() && !isValidRange(type)) {
+                return badRange(context, *args[i]);
+            }
+        }
+
+        return comp.getVoidType();
+    }
+
+private:
+    static bool isValidRange(const Type& type) {
+        ConstantRange range = type.getFixedRange();
+        return range.right >= range.left;
+    }
+
+    static const Type& badRange(const BindContext& context, const Expression& arg) {
+        context.addDiag(diag::PlaRangeInAscendingOrder, arg.sourceRange) << *arg.type;
+        return context.getCompilation().getErrorType();
     }
 };
 
@@ -719,6 +784,20 @@ void registerSystemTasks(Compilation& c) {
     TASK("$q_full", SubroutineKind::Function, 1, 1);
 
 #undef TASK
+
+#define PLA_TASK(name) c.addSystemSubroutine(std::make_unique<PlaTask>(name))
+    for (auto& fmt : { "$array", "$plane" }) {
+        for (auto& gate : { "$and", "$or", "$nand", "$nor" }) {
+            for (auto& type : { "$async", "$sync" }) {
+                std::string name(type);
+                name.append(gate);
+                name.append(fmt);
+                PLA_TASK(name);
+            }
+        }
+    }
+
+#undef PLA_TASK
 }
 
 } // namespace slang::Builtins
