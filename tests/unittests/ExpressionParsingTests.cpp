@@ -1,4 +1,5 @@
 #include "Test.h"
+#include "slang/syntax/SyntaxPrinter.h"
 
 using LF = LexerFacts;
 
@@ -757,5 +758,47 @@ module m;
 endmodule
 )";
     parseCompilationUnit(text);
+    CHECK_DIAGNOSTICS_EMPTY;
+}
+
+TEST_CASE("Dist expression parsing in disallowed contexts") {
+    auto& text = R"(
+class C;
+    rand bit a;
+    rand bit [3:0] b;
+    constraint cmd_c {
+        a  ->  b dist { 0 := 1, [1:15] := 1};
+        a  -> (b dist { 0 := 1, [1:15] := 1});
+    }
+
+    int i = 1 + a dist {0 := 1, [1:15] := 1};
+endclass
+)";
+    parseCompilationUnit(text);
+
+    REQUIRE(diagnostics.size() == 2);
+    CHECK(diagnostics[0].code == diag::NonstandardDist);
+    CHECK(diagnostics[1].code == diag::InvalidDistExpression);
+}
+
+TEST_CASE("Integer literal parsing regression GH #498") {
+    auto& text = R"(
+task foo(bit [31:0] a);
+	$display("%x", a);
+endtask: foo
+
+task test();
+	foo(32'h0e+32'h4000);
+endtask: test
+
+module m;
+initial begin
+	test();
+end
+endmodule
+)";
+    auto& syntax = parseCompilationUnit(text);
+    auto result = SyntaxPrinter().setSquashNewlines(false).print(syntax).str();
+    CHECK(result == text);
     CHECK_DIAGNOSTICS_EMPTY;
 }

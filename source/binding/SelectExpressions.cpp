@@ -820,9 +820,16 @@ Expression& MemberAccessExpression::fromSelector(
         case SymbolKind::UnpackedStructType:
         case SymbolKind::PackedUnionType:
         case SymbolKind::UnpackedUnionType:
-        case SymbolKind::ClassType:
             scope = &type.as<Scope>();
             break;
+        case SymbolKind::ClassType: {
+            auto& ct = type.as<ClassType>();
+            if (auto base = ct.getBaseClass(); base && base->isError())
+                return badExpr(compilation, &expr);
+
+            scope = &ct;
+            break;
+        }
         case SymbolKind::EnumType:
         case SymbolKind::StringType:
         case SymbolKind::FixedSizeUnpackedArrayType:
@@ -830,31 +837,14 @@ Expression& MemberAccessExpression::fromSelector(
         case SymbolKind::AssociativeArrayType:
         case SymbolKind::QueueType:
         case SymbolKind::EventType:
-        case SymbolKind::SequenceType:
+        case SymbolKind::SequenceType: {
+            if (auto result = tryBindSpecialMethod(compilation, expr, selector, invocation,
+                                                   withClause, context)) {
+                return *result;
+            }
+
             return CallExpression::fromSystemMethod(compilation, expr, selector, invocation,
                                                     withClause, context);
-        case SymbolKind::VirtualInterfaceType: {
-            if (errorIfNotProcedural())
-                return badExpr(compilation, &expr);
-
-            auto& vi = type.as<VirtualInterfaceType>();
-            if (vi.modport)
-                scope = vi.modport;
-            else
-                scope = &vi.iface;
-            break;
-        }
-        case SymbolKind::VoidType: {
-            // This is possible via a clocking block accessed through a virtual interface,
-            // so check for that case.
-            if (expr.kind == ExpressionKind::MemberAccess) {
-                auto sym = expr.getSymbolReference();
-                if (sym && sym->kind == SymbolKind::ClockingBlock) {
-                    scope = &sym->as<ClockingBlockSymbol>();
-                    break;
-                }
-            }
-            [[fallthrough]];
         }
         default: {
             if (auto result = tryBindSpecialMethod(compilation, expr, selector, invocation,
@@ -912,8 +902,7 @@ Expression& MemberAccessExpression::fromSelector(
             return CallExpression::fromLookup(compilation, &sub, &expr, invocation, withClause,
                                               range, context);
         }
-        case SymbolKind::ConstraintBlock:
-        case SymbolKind::ClockingBlock: {
+        case SymbolKind::ConstraintBlock: {
             if (errorIfNotProcedural())
                 return badExpr(compilation, &expr);
             return *compilation.emplace<MemberAccessExpression>(compilation.getVoidType(), expr,
@@ -1198,7 +1187,7 @@ bool MemberAccessExpression::verifyAssignableImpl(const BindContext& context,
     // If this is a selection of a class member, assignability depends only on the selected
     // member and not on the class handle itself. Otherwise, the opposite is true.
     auto& valueType = *value().type;
-    if (!valueType.isClass() && !valueType.isVirtualInterface() && !valueType.isVoid())
+    if (!valueType.isClass())
         return value().verifyAssignable(context, location, isNonBlocking, inConcat);
 
     if (VariableSymbol::isKind(member.kind)) {

@@ -754,16 +754,37 @@ void Scope::elaborate() const {
 
     SmallSet<const SyntaxNode*, 8> enumDecls;
     for (const auto& pair : deferredData.getTransparentTypes()) {
-        const Symbol* insertAt = pair.first;
-        const Type& type = pair.second->getDeclaredType()->getType();
+        auto insertAt = pair.first;
+        auto dt = pair.second->getDeclaredType();
 
-        if (type.kind == SymbolKind::EnumType) {
-            if (!type.getSyntax() || enumDecls.insert(type.getSyntax()).second) {
-                for (const auto& value : type.as<EnumType>().values()) {
+        const Type* type = &dt->getType();
+        while (type->isPackedArray())
+            type = type->getArrayElementType();
+
+        if (type->kind == SymbolKind::EnumType) {
+            if (!type->getSyntax() || enumDecls.insert(type->getSyntax()).second) {
+                for (const auto& value : type->as<EnumType>().values()) {
                     auto wrapped = compilation.emplace<TransparentMemberSymbol>(value);
                     insertMember(wrapped, insertAt, true, false);
                     insertAt = wrapped;
                 }
+            }
+        }
+        else {
+            // If there was an error with the enum definition, we still want to
+            // add all of the members into this scope so that we don't get
+            // further errors reported.
+            auto syntax = dt->getTypeSyntax();
+            ASSERT(syntax);
+            ASSERT(type->kind == SymbolKind::ErrorType);
+
+            SmallVectorSized<const Symbol*, 8> members;
+            BindContext context(*this, LookupLocation::max);
+            EnumType::createDefaultMembers(context, syntax->as<EnumTypeSyntax>(), members);
+
+            for (auto member : members) {
+                insertMember(member, insertAt, true, false);
+                insertAt = member;
             }
         }
     }
@@ -1045,12 +1066,12 @@ span<Symbol* const> Scope::DeferredMemberData::getMembers() const {
 
 void Scope::DeferredMemberData::registerTransparentType(const Symbol* insertion,
                                                         const Symbol& parent) {
-    transparentTypes.emplace(insertion, &parent);
+    transparentTypes.emplace_back(insertion, &parent);
 }
 
-iterator_range<Scope::DeferredMemberData::TransparentTypeMap::const_iterator> Scope::
-    DeferredMemberData::getTransparentTypes() const {
-    return { transparentTypes.begin(), transparentTypes.end() };
+span<std::pair<const Symbol*, const Symbol*> const> Scope::DeferredMemberData::getTransparentTypes()
+    const {
+    return transparentTypes;
 }
 
 void Scope::DeferredMemberData::addForwardingTypedef(const ForwardingTypedefSymbol& symbol) {

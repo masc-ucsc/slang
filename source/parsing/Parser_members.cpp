@@ -618,8 +618,13 @@ FunctionPrototypeSyntax& Parser::parseFunctionPrototype(SyntaxKind parentKind,
     if (!checkSubroutineName(name))
         addDiag(diag::ExpectedSubroutineName, keyword.location()) << name.sourceRange();
 
-    if (options.has(FunctionOptions::IsPrototype) && name.kind == SyntaxKind::ScopedName)
+    if (options.has(FunctionOptions::IsPrototype) && name.kind == SyntaxKind::ScopedName) {
         addDiag(diag::SubroutinePrototypeScoped, name.getFirstToken().location());
+    }
+    else if (lifetime.kind == TokenKind::StaticKeyword && name.kind == SyntaxKind::ScopedName &&
+             name.as<ScopedNameSyntax>().separator.kind == TokenKind::DoubleColon) {
+        addDiag(diag::MethodStaticLifetime, lifetime.location()) << lifetime.range();
+    }
 
     bool constructor = getLastConsumed().kind == TokenKind::NewKeyword;
     if (isConstructor)
@@ -1830,7 +1835,8 @@ ConstraintItemSyntax* Parser::parseConstraintItem(bool allowBlock, bool isTopLev
             // we can find out for sure one way or the other.
             if (allowBlock) {
                 uint32_t index = 1;
-                if (!scanTypePart<isNotInConcatenationExpr>(index, TokenKind::OpenBrace,
+                if (peek(1).kind == TokenKind::CloseBrace ||
+                    !scanTypePart<isNotInConcatenationExpr>(index, TokenKind::OpenBrace,
                                                             TokenKind::CloseBrace)) {
                     return &parseConstraintBlock(false);
                 }
@@ -1851,15 +1857,11 @@ ConstraintItemSyntax* Parser::parseConstraintItem(bool allowBlock, bool isTopLev
 
     // at this point we either have an expression with optional distribution or
     // we have an implication constraint
-    auto expr = &parseSubExpression(ExpressionOptions::ConstraintContext, 0);
+    auto expr =
+        &parseSubExpression(ExpressionOptions::ConstraintContext | ExpressionOptions::AllowDist, 0);
     if (peek(TokenKind::MinusArrow)) {
         auto arrow = consume();
         return &factory.implicationConstraint(*expr, arrow, *parseConstraintItem(true, false));
-    }
-
-    if (peek(TokenKind::DistKeyword)) {
-        auto& dist = parseDistConstraintList();
-        expr = &factory.expressionOrDist(*expr, dist);
     }
 
     return &factory.expressionConstraint(Token(), *expr, expect(TokenKind::Semicolon));

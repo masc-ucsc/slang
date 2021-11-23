@@ -459,8 +459,8 @@ const Symbol* Expression::getSymbolReference(bool allowPacked) const {
         case ExpressionKind::MemberAccess: {
             auto& access = as<MemberAccessExpression>();
             auto& val = access.value();
-            if (allowPacked || val.type->isClass() || val.type->isVirtualInterface() ||
-                val.type->isVoid() || val.type->isUnpackedStruct() || val.type->isUnpackedUnion()) {
+            if (allowPacked || val.type->isClass() || val.type->isUnpackedStruct() ||
+                val.type->isUnpackedUnion()) {
                 return &access.member;
             }
             return nullptr;
@@ -782,8 +782,8 @@ Expression& Expression::bindName(Compilation& compilation, const NameSyntax& syn
         if (context.firstIterator) {
             LookupResult result;
             if (Lookup::findIterator(*context.scope, *context.firstIterator, syntax, result)) {
-                return bindLookupResult(compilation, result, syntax, invocation, withClause,
-                                        context);
+                return bindLookupResult(compilation, result, syntax.sourceRange(), invocation,
+                                        withClause, context);
             }
         }
 
@@ -794,8 +794,8 @@ Expression& Expression::bindName(Compilation& compilation, const NameSyntax& syn
             if (Lookup::withinClassRandomize(*context.randomizeDetails->classType,
                                              context.randomizeDetails->nameRestrictions, syntax,
                                              flags, result)) {
-                return bindLookupResult(compilation, result, syntax, invocation, withClause,
-                                        context);
+                return bindLookupResult(compilation, result, syntax.sourceRange(), invocation,
+                                        withClause, context);
             }
             else if (result.hasError()) {
                 result.reportErrors(context);
@@ -807,8 +807,8 @@ Expression& Expression::bindName(Compilation& compilation, const NameSyntax& syn
             // Look for a matching local assertion variable.
             LookupResult result;
             if (Lookup::findAssertionLocalVar(context, syntax, result)) {
-                return bindLookupResult(compilation, result, syntax, invocation, withClause,
-                                        context);
+                return bindLookupResult(compilation, result, syntax.sourceRange(), invocation,
+                                        withClause, context);
             }
         }
     }
@@ -828,11 +828,12 @@ Expression& Expression::bindName(Compilation& compilation, const NameSyntax& syn
                                           callRange, context);
     }
 
-    return bindLookupResult(compilation, result, syntax, invocation, withClause, context);
+    return bindLookupResult(compilation, result, syntax.sourceRange(), invocation, withClause,
+                            context);
 }
 
-Expression& Expression::bindLookupResult(Compilation& compilation, const LookupResult& result,
-                                         const NameSyntax& syntax,
+Expression& Expression::bindLookupResult(Compilation& compilation, LookupResult& result,
+                                         SourceRange sourceRange,
                                          const InvocationExpressionSyntax* invocation,
                                          const ArrayOrRandomizeMethodExpressionSyntax* withClause,
                                          const BindContext& context) {
@@ -840,7 +841,6 @@ Expression& Expression::bindLookupResult(Compilation& compilation, const LookupR
     if (!symbol)
         return badExpr(compilation, nullptr);
 
-    SourceRange sourceRange = syntax.sourceRange();
     auto errorIfInvoke = [&]() {
         // If we require a subroutine, enforce that now. The invocation syntax will have been
         // nulled out if we used it elsewhere in this function.
@@ -860,7 +860,7 @@ Expression& Expression::bindLookupResult(Compilation& compilation, const LookupR
 
     if (context.flags.has(BindFlags::AllowDataType) && symbol->isType()) {
         // We looked up a named data type and we were allowed to do so, so return it.
-        const Type& resultType = Type::fromLookupResult(compilation, result, syntax, context);
+        const Type& resultType = Type::fromLookupResult(compilation, result, sourceRange, context);
         auto expr = compilation.emplace<DataTypeExpression>(resultType, sourceRange);
         if (!expr->bad() && !errorIfInvoke())
             return badExpr(compilation, expr);
@@ -883,6 +883,7 @@ Expression& Expression::bindLookupResult(Compilation& compilation, const LookupR
     Expression* expr;
     switch (symbol->kind) {
         case SymbolKind::Subroutine: {
+            ASSERT(result.selectors.empty());
             SourceRange callRange = invocation ? invocation->sourceRange() : sourceRange;
             expr = &CallExpression::fromLookup(compilation, &symbol->as<SubroutineSymbol>(),
                                                nullptr, invocation, withClause, callRange, context);
@@ -892,20 +893,20 @@ Expression& Expression::bindLookupResult(Compilation& compilation, const LookupR
         }
         case SymbolKind::Sequence:
         case SymbolKind::Property:
-            expr =
-                &AssertionInstanceExpression::fromLookup(*symbol, invocation, sourceRange, context);
-            invocation = nullptr;
-            break;
-        case SymbolKind::LetDecl:
-            expr =
-                &AssertionInstanceExpression::fromLookup(*symbol, invocation, sourceRange, context);
-            if (result.isHierarchical) {
-                SourceRange callRange = invocation ? invocation->sourceRange() : sourceRange;
+        case SymbolKind::LetDecl: {
+            const InvocationExpressionSyntax* localInvoke = nullptr;
+            if (result.selectors.empty())
+                localInvoke = std::exchange(invocation, nullptr);
+
+            expr = &AssertionInstanceExpression::fromLookup(*symbol, localInvoke, sourceRange,
+                                                            context);
+
+            if (symbol->kind == SymbolKind::LetDecl && result.isHierarchical) {
+                SourceRange callRange = localInvoke ? localInvoke->sourceRange() : sourceRange;
                 context.addDiag(diag::LetHierarchical, callRange);
             }
-
-            invocation = nullptr;
             break;
+        }
         case SymbolKind::AssertionPort:
             expr = &AssertionInstanceExpression::bindPort(*symbol, sourceRange, context);
             break;
@@ -924,18 +925,41 @@ Expression& Expression::bindLookupResult(Compilation& compilation, const LookupR
     }
 
     // Drill down into member accesses.
-    for (auto& selector : result.selectors) {
+    for (size_t i = 0; i < result.selectors.size(); i++) {
         if (expr->bad())
             return *expr;
 
+        auto& selector = result.selectors[i];
         auto memberSelect = std::get_if<LookupResult::MemberSelector>(&selector);
         if (memberSelect) {
-            expr = &MemberAccessExpression::fromSelector(compilation, *expr, *memberSelect,
-                                                         invocation, withClause, context);
-            if (expr->kind == ExpressionKind::Call) {
-                // TODO: what if this is not the last selector in the chain?
-                invocation = nullptr;
-                withClause = nullptr;
+            // If this is an access via a virtual interface we need to look at
+            // all the selectors together, as this may constitute a hierarchical reference.
+            if (expr->type->isVirtualInterface()) {
+                LookupResult nextResult;
+                span<LookupResult::Selector> selectors = result.selectors;
+                Lookup::selectChild(*expr->type, expr->sourceRange, selectors.subspan(i), context,
+                                    nextResult);
+
+                nextResult.reportErrors(context);
+                if (!nextResult.found)
+                    return badExpr(compilation, expr);
+
+                return bindLookupResult(compilation, nextResult, sourceRange, invocation,
+                                        withClause, context);
+            }
+
+            if (i == result.selectors.size() - 1) {
+                expr = &MemberAccessExpression::fromSelector(compilation, *expr, *memberSelect,
+                                                             invocation, withClause, context);
+
+                if (expr->kind == ExpressionKind::Call) {
+                    invocation = nullptr;
+                    withClause = nullptr;
+                }
+            }
+            else {
+                expr = &MemberAccessExpression::fromSelector(compilation, *expr, *memberSelect,
+                                                             nullptr, nullptr, context);
             }
         }
         else {
@@ -999,6 +1023,7 @@ Expression* Expression::tryBindInterfaceRef(const BindContext& context,
     if (!result.found)
         return nullptr;
 
+    auto& comp = context.getCompilation();
     auto symbol = result.found;
     if (symbol->kind == SymbolKind::InterfacePort) {
         auto& ifacePort = symbol->as<InterfacePortSymbol>();
@@ -1016,8 +1041,13 @@ Expression* Expression::tryBindInterfaceRef(const BindContext& context,
             }
         }
 
-        if (!symbol)
-            return nullptr;
+        if (!symbol) {
+            // Returning nullptr from this function means to try doing normal expression
+            // binding, but if we hit this case here we found the iface and simply failed
+            // to connect it, likely because we're in an uninstantiated context. Return
+            // a badExpr here to silence any follow on errors that might otherwise result.
+            return &badExpr(comp, nullptr);
+        }
     }
     else if ((symbol->kind == SymbolKind::Instance && symbol->as<InstanceSymbol>().isInterface()) ||
              symbol->kind == SymbolKind::Modport) {
@@ -1046,8 +1076,7 @@ Expression* Expression::tryBindInterfaceRef(const BindContext& context,
         // TODO: error
     }
 
-    return context.getCompilation().emplace<HierarchicalReferenceExpression>(*symbol, targetType,
-                                                                             syntax.sourceRange());
+    return comp.emplace<HierarchicalReferenceExpression>(*symbol, targetType, syntax.sourceRange());
 }
 
 void Expression::findPotentiallyImplicitNets(const SyntaxNode& expr, const BindContext& context,

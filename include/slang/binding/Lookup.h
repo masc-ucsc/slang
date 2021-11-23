@@ -18,6 +18,7 @@ class IteratorSymbol;
 class Scope;
 class Symbol;
 class SystemSubroutine;
+class Type;
 struct ElementSelectSyntax;
 struct NameSyntax;
 struct ScopedNameSyntax;
@@ -128,10 +129,11 @@ struct LookupResult {
     /// Set to true if the symbol was found via upward name resolution.
     bool isUpwardName = false;
 
-    /// Set to true if we observed an invalid import statement somewhere during lookup.
-    /// This means the lack of a found symbol should be treated with caution, because
-    /// it could be the import failure causing it instead of some otherwise invalid name.
-    bool sawBadImport = false;
+    /// Set to true if there were problems during lookup that indicate we should
+    /// ignore the lack of a found symbol, because we're in a context where such
+    /// a failure may be expected (for example, within a default instantiation of
+    /// a generic class where the base class fails to resolve).
+    bool suppressUndeclared = false;
 
     /// Set to true if the lookup was resolved through a type parameter. Some language
     /// rules restrict where this can be done.
@@ -225,6 +227,13 @@ public:
     static const Symbol* selectChild(const Symbol& symbol,
                                      span<const ElementSelectSyntax* const> selectors,
                                      const BindContext& context, LookupResult& result);
+
+    /// Applies the given @a selectors to the @a virtualInterface type and returns the
+    /// selected child in @result -- if any errors occur, diagnostics are issued to
+    /// the result object and nullptr is returned.
+    static void selectChild(const Type& virtualInterface, SourceRange range,
+                            span<LookupResult::Selector> selectors, const BindContext& context,
+                            LookupResult& result);
 
     /// Searches for a class with the given @a name within @a context -- if no symbol is
     /// found, or if the found symbol is not a class type, appropriate diagnostics are issued.

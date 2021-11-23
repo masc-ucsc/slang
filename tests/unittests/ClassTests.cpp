@@ -2315,3 +2315,190 @@ endclass
     compilation.addSyntaxTree(tree);
     NO_COMPILATION_ERRORS;
 }
+
+TEST_CASE("Extern task default val regress GH #475") {
+    auto tree = SyntaxTree::fromText(R"(
+class C;
+    extern task f(bit[7:0] i[$]='{});
+endclass
+
+task C::f(bit[7:0] i[$]='{});
+endtask
+)");
+
+    // Just test no crash.
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+}
+
+TEST_CASE("Select expressions in constraints can be more permissive with types") {
+    auto tree = SyntaxTree::fromText(R"(
+class A;
+    rand int min;
+    rand int max;
+    int name;
+endclass
+
+class C;
+    int t[string];
+    rand A arr[$];
+    constraint tags_c {
+        foreach (arr[i]) {
+            arr[i].name == t["G1"] -> arr[i].min == 0 && arr[i].max == 1000;
+        }
+    }
+    function new();
+        t["G1"] = 1;
+    endfunction
+endclass
+
+class D;
+    string s[$];
+    function void f();
+        int i;
+        int j = std::randomize(i) with {
+            i < s.size();
+        };
+    endfunction
+endclass
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("rand_mode as a function") {
+    auto tree = SyntaxTree::fromText(R"(
+class C;
+    rand int i;
+    function void f();
+        rand_mode(0);
+        this.rand_mode(0);
+        i.rand_mode(0);
+    endfunction
+endclass
+module top;
+    C c;
+    function void make();
+        c = new();
+        c.rand_mode(0);
+    endfunction
+    initial begin
+        make();
+    end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Out-of-block class method with static lifetime") {
+    auto tree = SyntaxTree::fromText(R"(
+class C;
+    extern task t1();
+    extern task t2();
+endclass
+task automatic C::t1();
+endtask
+task static C::t2();
+endtask
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 1);
+    CHECK(diags[0].code == diag::MethodStaticLifetime);
+}
+
+TEST_CASE("Base class constructor checking order of inheritance") {
+    auto tree = SyntaxTree::fromText(R"(
+typedef class A;
+
+class B extends A;
+endclass
+
+class Top;
+    int i;
+endclass
+
+class A extends Top;
+    function new();
+        B b;
+        b.i = 1;
+    endfunction
+endclass
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Uninstantiated generic class inheritance regress GH #485") {
+    auto tree = SyntaxTree::fromText(R"(
+class base;
+    int n;
+    function void f();
+        n = 0;
+    endfunction
+endclass
+
+class child #(type SUPER_CLASS=base) extends SUPER_CLASS;
+    function void f();
+        super.f();
+        n = 3;
+    endfunction
+endclass
+
+module top;
+endmodule
+
+class child2 #(type SUPER_CLASS=base) extends SUPER_CLASS;
+    function new();
+        super.new();
+    endfunction
+endclass
+
+virtual class ovm_object;
+endclass
+
+class child3 #(type SUPER_CLASS=base) extends SUPER_CLASS;
+    function ovm_object create(string name="");
+        child3#(SUPER_CLASS) obj = new();
+        if (name != "") begin
+            obj.set_name(name);
+        end
+        return obj;
+    endfunction
+endclass
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Empty constraint set regression GH #494") {
+    auto tree = SyntaxTree::fromText(R"(
+class C;
+    int mode;
+    rand int b;
+    constraint c {
+        if (mode == 0) {
+            b > 2;
+        } else {
+            // TODO
+        }
+    }
+endclass
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}

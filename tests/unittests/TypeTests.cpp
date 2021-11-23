@@ -918,6 +918,8 @@ module m;
     struct packed { logic [3:0] a; int b; } [4:1] s;
     union packed { logic [3:0] a; bit [1:4] b; } [4:1] u;
     enum { A, B, C } [4:1] e;
+
+    initial e = A;
 endmodule
 )");
 
@@ -1283,6 +1285,67 @@ endprogram
     NO_COMPILATION_ERRORS;
 }
 
+TEST_CASE("Virtual interfaces with nested hierarchical names") {
+    auto tree = SyntaxTree::fromText(R"(
+interface clk_generator(output logic clk);
+time period;
+initial begin
+    clk = 0;
+    period = 0ns;
+    forever begin
+        if (period != 0ns) begin
+            #(period/2) clk = 1;
+            #(period/2) clk = 0;
+        end else begin
+            clk = 0;
+            @(period);
+        end
+    end
+end
+endinterface
+
+interface testbench(output logic clk_slow, output logic clk_fast);
+    clk_generator bus_clk_slow(
+        .clk(clk_slow)
+    );
+    clk_generator bus_clk_fast(
+        .clk(clk_fast)
+    );
+endinterface
+
+class TB;
+    virtual testbench tb_intf;
+
+    task run();
+        tb_intf.bus_clk_slow.period = 10ns;
+        #1us;
+        tb_intf.bus_clk_fast.period = 2ns;
+        #1us;
+        tb_intf.bus_clk_slow.period = 0ns;
+    endtask
+endclass
+
+module top;
+    logic clk_100;
+    logic clk_500;
+
+    testbench testbench(
+        .clk_slow (clk_100),
+        .clk_fast (clk_500)
+    );
+
+    initial begin
+        TB tb;
+        tb = new();
+    end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
 TEST_CASE("Typedef + type param colon access regress GH #471") {
     auto tree = SyntaxTree::fromText(R"(
 class C #(type T);
@@ -1291,6 +1354,187 @@ class C #(type T);
         return obj_type::type_id::create();
     endfunction
 endclass
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("rand_mode on dynamic array regress GH #478") {
+    auto tree = SyntaxTree::fromText(R"(
+class r;
+    rand bit v[];
+    function void pre_randomize();
+        v.rand_mode(0);
+    endfunction
+endclass
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("virtual interfaces in uninstantiated modules GH #481") {
+    auto tree = SyntaxTree::fromText(R"(
+class C;
+    virtual bus_intf _bus;
+    function new(virtual bus_intf bus);
+        _bus = bus;
+    endfunction
+    function void set_intf(virtual bus_intf bus);
+        _bus = bus;
+    endfunction
+endclass
+
+interface bus_intf;
+endinterface
+
+interface tb_intf(
+    bus_intf bus
+);
+    C c;
+    initial begin
+        c = new(bus);
+        c.set_intf(bus);
+        c._bus = bus;
+    end
+endinterface
+
+module top;
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("virtual interfaces member access via nested member") {
+    auto tree = SyntaxTree::fromText(R"(
+interface clk_generator(output logic clk);
+time period;
+initial begin
+    clk = 0;
+    period = 0ns;
+    forever begin
+        if (period != 0ns) begin
+            #(period/2) clk = 1;
+            #(period/2) clk = 0;
+        end else begin
+            clk = 0;
+            @(period);
+        end
+    end
+end
+endinterface
+
+interface testbench(output logic clk_slow, output logic clk_fast);
+    clk_generator bus_clk_slow(
+        .clk(clk_slow)
+    );
+    clk_generator bus_clk_fast(
+        .clk(clk_fast)
+    );
+endinterface
+
+class TB;
+    virtual testbench tb_intf[$];
+
+    task run();
+        foreach (tb_intf[i]) begin
+            fork
+                automatic int j = i;
+                begin
+                    tb_intf[j].bus_clk_slow.period = 10ns;
+                    #1us;
+                    tb_intf[j].bus_clk_fast.period = 2ns;
+                    #1us;
+                    tb_intf[j].bus_clk_slow.period = 0ns;
+                end
+             join_none
+        end
+        wait fork;
+    endtask
+endclass
+
+module top;
+    logic [1:0] clk_100;
+    logic [1:0] clk_500;
+
+    testbench testbench0(
+        .clk_slow (clk_100[0]),
+        .clk_fast (clk_500[0])
+    );
+
+    testbench testbench1(
+        .clk_slow (clk_100[1]),
+        .clk_fast (clk_500[1])
+    );
+
+    initial begin
+        TB tb;
+        tb = new();
+    end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Invalid enum base regress GH #472") {
+    auto tree = SyntaxTree::fromText(R"(
+package pkg;
+    typedef enum node [3:0] {
+        IDLE    = 4'h0,
+        NOTIDLE
+    } CXDB_SM_t;
+
+    typedef enum node [15:0] {
+        BP_IDLE    = 16'(1<<IDLE),
+        BP_NOTIDLE = 16'(1<<NOTIDLE)
+    } CXDB_BP_SM_t;
+endpackage
+
+module test
+import pkg::*;
+#(parameter bit A = 0) ();
+localparam logic [3:0] SM_IDLE = A ? BP_IDLE : IDLE;
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 2);
+    CHECK(diags[0].code == diag::UndeclaredIdentifier);
+    CHECK(diags[1].code == diag::UndeclaredIdentifier);
+}
+
+TEST_CASE("Intermittent enum label failure GH #487") {
+    auto tree = SyntaxTree::fromText(R"(
+`ifdef TWOSTATE
+    typedef bit node;
+`else
+    typedef logic node;
+`endif
+
+typedef enum node [3:0] {
+    IDLE = 4'h0,
+    NOTIDLE
+} sm_t;
+
+typedef enum node [15:0] {
+    BP_IDLE    = 16'(1<<IDLE),
+    BP_NOTIDLE = 16'(1<<NOTIDLE)
+} bp_sm_t;
+
+module top;
+endmodule
 )");
 
     Compilation compilation;
